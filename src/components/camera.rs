@@ -16,8 +16,8 @@ impl Camera
     pub fn get_view_projection_matrices(
         camera: &Camera,
         window_size: [f32; 2],
-        near_far_distance: [f32; 2])
-        -> ([[f32; 4]; 4], [[f32; 4]; 4])
+        near_far_distance: [f32; 2]
+    ) -> ([[f32; 4]; 4], [[f32; 4]; 4])
     {
         let (_, _, translation) = camera.transform.to_scale_rotation_translation();
 

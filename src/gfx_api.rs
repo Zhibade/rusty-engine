@@ -428,8 +428,8 @@ impl GfxApi
     fn get_best_physical_device_and_queue(
         instance: &Arc<Instance>,
         event_loop: &ActiveEventLoop,
-        device_extensions: &DeviceExtensions)
-        -> (Arc<PhysicalDevice>, u32)
+        device_extensions: &DeviceExtensions
+    ) -> (Arc<PhysicalDevice>, u32)
     {
         let (physical_device, queue_family_index) = instance
             .enumerate_physical_devices()
@@ -514,8 +514,8 @@ impl GfxApi
     /// Allocate view + perspective projection matrices data using given [MemoryAllocator]
     fn allocate_view_perspective_data_buffer(
         memory_allocator: Arc<dyn MemoryAllocator>,
-        view_projection_data: ViewProjectionData)
-        -> Subbuffer<ViewProjectionData>
+        view_projection_data: ViewProjectionData
+    ) -> Subbuffer<ViewProjectionData>
     {
         let buffer_create_info = BufferCreateInfo
         {
@@ -545,8 +545,8 @@ impl GfxApi
         swapchain: &Arc<Swapchain>,
         render_pass: &Arc<RenderPass>,
         vert_shader_entry_point: EntryPoint,
-        frag_shader_entry_point: EntryPoint)
-        -> Arc<GraphicsPipeline>
+        frag_shader_entry_point: EntryPoint
+    ) -> Arc<GraphicsPipeline>
     {
         let vertex_input_state = VertexData::per_vertex()
             .definition(&vert_shader_entry_point)
@@ -647,8 +647,8 @@ impl GfxApi
     /// Create a framebuffer per image and making them compatible with the given render pass
     fn create_framebuffers(
         images: &Vec<Arc<Image>>,
-        render_pass: &Arc<RenderPass>)
-        -> Vec<Arc<Framebuffer>>
+        render_pass: &Arc<RenderPass>
+    ) -> Vec<Arc<Framebuffer>>
     {
         let mut framebuffers = Vec::new();
 
@@ -678,8 +678,8 @@ impl GfxApi
     fn load_shaders(
         device: Arc<Device>,
         vert_shader_path: impl AsRef<Path>,
-        frag_shader_path: impl AsRef<Path>)
-        -> (EntryPoint, EntryPoint)
+        frag_shader_path: impl AsRef<Path>
+    ) -> (EntryPoint, EntryPoint)
     {
         let paths = Vec::from([vert_shader_path.as_ref(), frag_shader_path.as_ref()]);
         let mut entry_points = Vec::new();
