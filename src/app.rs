@@ -1,7 +1,9 @@
 //! Window application implementation
 
+use super::components::camera::Camera;
 use super::gfx_api::GfxApi;
 use std::sync::Arc;
+use glam::{Mat4, Vec3};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop:: {ActiveEventLoop, ControlFlow, EventLoop};
@@ -11,8 +13,9 @@ use winit::window::{Window, WindowId};
 #[derive(Default)]
 pub struct App
 {
-    window: Option<Arc<Window>>,
+    camera: Camera,
     gfx_api: Option<GfxApi>,
+    window: Option<Arc<Window>>,
 }
 
 impl App
@@ -34,6 +37,11 @@ impl ApplicationHandler for App
         // Initialize window and graphics API on window startup
         self.window = Some(Arc::new(event_loop.create_window(Window::default_attributes()).unwrap()));
         self.gfx_api = Some(GfxApi::new(event_loop, self.window.clone().unwrap()));
+        self.camera = Camera
+        {
+            transform: Mat4::from_translation(Vec3::from_array([0.0, 0.0, -2.0])),
+            ..Default::default()
+        };
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _window_id: WindowId, event: WindowEvent)
@@ -47,6 +55,15 @@ impl ApplicationHandler for App
 
             WindowEvent::RedrawRequested =>
                 {
+                    // Send camera updated transform to graphics API
+                    let (view_matrix, projection_matrix) = Camera::get_view_projection_matrices(
+                        &self.camera,
+                        self.window.as_ref().unwrap().inner_size().into(),
+                        [0.0, 10000.0]
+                    );
+
+                    self.gfx_api.as_mut().unwrap().update_camera(view_matrix, projection_matrix);
+
                     // Render frame and update window
                     self.gfx_api.as_mut().unwrap().render();
                     self.window.as_ref().unwrap().request_redraw();

@@ -1,6 +1,7 @@
 //! Rusty engine main entry point
 
 mod app;
+mod components;
 mod gfx_api;
 
 fn main()

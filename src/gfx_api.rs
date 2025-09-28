@@ -1,12 +1,17 @@
 //! Graphics API that will be used to render onto the application's window
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
+use std::mem::size_of;
 use std::path::Path;
 use std::sync::Arc;
+use glam::Mat4;
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, RenderPassBeginInfo};
+use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferExecFuture, CommandBufferUsage, RenderPassBeginInfo};
+use vulkano::descriptor_set::{DescriptorSet, WriteDescriptorSet};
+use vulkano::descriptor_set::allocator::{StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo};
 use vulkano::device::{Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags};
 use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::image::{Image, ImageUsage};
@@ -15,39 +20,59 @@ use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, Insta
 use vulkano::library::VulkanLibrary;
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator};
 use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
-use vulkano::pipeline::{DynamicState, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo};
+use vulkano::pipeline::{DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace, RasterizationState};
 use vulkano::pipeline::graphics::viewport::{Scissor, Viewport, ViewportState};
-use vulkano::pipeline::layout::{PipelineDescriptorSetLayoutCreateInfo};
+use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
-use vulkano::shader::{EntryPoint, ShaderModule, ShaderModuleCreateInfo};
-use vulkano::swapchain::{self, CompositeAlpha, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo};
+use vulkano::shader::{EntryPoint, ShaderModule, ShaderModuleCreateInfo, ShaderStages};
+use vulkano::swapchain::{self, CompositeAlpha, PresentFuture, Surface, Swapchain, SwapchainAcquireFuture, SwapchainCreateInfo, SwapchainPresentInfo};
 use vulkano::sync::{self, GpuFuture};
 use vulkano::{Validated, Version, VulkanError};
+use vulkano::descriptor_set::layout::{DescriptorSetLayout, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo, DescriptorType};
+use vulkano::sync::future::{FenceSignalFuture, JoinFuture, NowFuture};
 use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
+
+/// Object's transform data (passed as a push constant)
+#[derive(BufferContents, Clone, Default)]
+#[repr(C)]
+struct ObjectTransformData
+{
+    matrix: [[f32; 4]; 4],
+}
 
 /// Model vertex buffer data
 #[derive(BufferContents, Vertex)]
 #[repr(C)]
 struct VertexData
 {
-    #[format(R32G32_SFLOAT)]
-    position: [f32; 2],
+    #[format(R32G32B32_SFLOAT)]
+    position: [f32; 3],
 
     #[format(R32G32B32_SFLOAT)]
     color: [f32; 3],
+}
+
+/// View + perspective projection matrices (passed as a uniform buffer)
+#[derive(BufferContents, Clone, Default)]
+#[repr(C)]
+struct ViewProjectionData
+{
+    view_matrix: [[f32; 4]; 4],
+    perspective_matrix: [[f32; 4]; 4],
 }
 
 /// Graphics API interface
 /// Only Vulkan is supported at the moment
 pub struct GfxApi
 {
+    // Common application objects that are accessed at many different points of the application
     device: Arc<Device>,
     queue: Arc<Queue>,
     swapchain: Arc<Swapchain>,
@@ -56,10 +81,21 @@ pub struct GfxApi
     graphics_pipeline: Arc<GraphicsPipeline>,
     framebuffers: Vec<Arc<Framebuffer>>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+    descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
+
+    // Rendering data that will be used in the shaders
     vertex_buffer: Subbuffer<[VertexData]>, // Hard-coded triangle vertex buffer
+    object_transform_data: ObjectTransformData, // Hard-coded object transform buffer
+    view_projection_data: ViewProjectionData, // Current camera (view-projection) data
+    view_perspective_data_buffer: Subbuffer<ViewProjectionData>,
+    view_perspective_data_descriptor_set: Arc<DescriptorSet>,
+
+    // Data related to presenting onto the surface each frame
     should_recreate_swapchain: bool,
     window_size: [u32; 2],
-    previous_frame_end: Option<Box<dyn GpuFuture>>,
+    previous_frame_end: Option<FenceSignalFuture<PresentFuture<CommandBufferExecFuture<JoinFuture<NowFuture, SwapchainAcquireFuture>>>>>,
+    // ^ Need this ridiculous nested type to be able to use FenceSignalFuture's API
+    // TODO: Might be able to improve it through different API?
 }
 
 impl GfxApi
@@ -190,19 +226,37 @@ impl GfxApi
         // Create matching framebuffers for swapchain images
         let framebuffers = Self::create_framebuffers(&swapchain_images, &render_pass);
 
-        // Create global memory allocators
+        // Create memory allocators
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
             device.clone(),
             StandardCommandBufferAllocatorCreateInfo::default(),
         ));
 
+        let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(
+            device.clone(),
+            StandardDescriptorSetAllocatorCreateInfo::default()
+        ));
+
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
-        // Allocate hard-coded triangle mesh
-        let vertex_buffer = Self::allocate_vertex_buffer(memory_allocator);
+        // Allocate hard-coded triangle mesh and set position
+        let vertex_buffer = Self::allocate_vertex_buffer(memory_allocator.clone());
 
-        // Initialize previous frame to now so that it can start rendering right away
-        let previous_frame_end = Some(sync::now(device.clone()).boxed());
+        let object_transform_data =
+            ObjectTransformData { matrix: Mat4::IDENTITY.to_cols_array_2d() };
+
+        // Allocate view and perspective projection data
+        let view_projection_data = ViewProjectionData::default();
+        let view_perspective_data_buffer =
+            Self::allocate_view_perspective_data_buffer(memory_allocator, view_projection_data.clone());
+
+        let view_perspective_data_descriptor_set = DescriptorSet::new(
+            descriptor_set_allocator.clone(),
+            graphics_pipeline.layout().set_layouts().get(0).unwrap().clone(),
+            [WriteDescriptorSet::buffer(0, view_perspective_data_buffer.clone())],
+            []
+        )
+        .unwrap();
 
         GfxApi {
             device,
@@ -213,10 +267,15 @@ impl GfxApi
             graphics_pipeline,
             framebuffers,
             command_buffer_allocator,
+            descriptor_set_allocator,
             vertex_buffer,
+            object_transform_data,
+            view_projection_data,
+            view_perspective_data_buffer,
+            view_perspective_data_descriptor_set,
             should_recreate_swapchain: false,
             window_size: window.inner_size().into(),
-            previous_frame_end,
+            previous_frame_end: None,
         }
     }
 
@@ -231,9 +290,6 @@ impl GfxApi
     /// Record and execute rendering commands once the next frame image is ready
     pub fn render(&mut self)
     {
-        // Cleanup finished futures
-        self.previous_frame_end.as_mut().unwrap().cleanup_finished();
-
         // If needed, recreate swapchain and framebuffers before rendering
         if self.should_recreate_swapchain
         {
@@ -257,7 +313,7 @@ impl GfxApi
             self.queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit
         )
-            .expect("Failed to create command buffer builder");
+        .expect("Failed to create command buffer builder");
 
         let render_pass_begin_info = RenderPassBeginInfo
         {
@@ -265,24 +321,48 @@ impl GfxApi
             ..RenderPassBeginInfo::framebuffer(self.framebuffers[image_index as usize].clone())
         };
 
-        command_buffer_builder.begin_render_pass(render_pass_begin_info, Default::default()).unwrap()
-            .set_viewport(0, [self.viewport.clone()].into_iter().collect()).unwrap()
-            .bind_pipeline_graphics(self.graphics_pipeline.clone()).unwrap()
-            .bind_vertex_buffers(0, self.vertex_buffer.clone()).ok();
+        command_buffer_builder.begin_render_pass(
+            render_pass_begin_info,
+            Default::default()
+        )
+        .unwrap()
+        .set_viewport(0, [self.viewport.clone()].into_iter().collect()).unwrap()
+        .bind_pipeline_graphics(self.graphics_pipeline.clone()).unwrap()
+        .bind_vertex_buffers(0, self.vertex_buffer.clone()).unwrap()
+        .bind_descriptor_sets(
+            PipelineBindPoint::Graphics,
+            self.graphics_pipeline.layout().clone(),
+            0,
+            self.view_perspective_data_descriptor_set.clone()
+        )
+        .unwrap()
+        .push_constants(self.graphics_pipeline.layout().clone(), 0, self.object_transform_data.clone()).ok();
 
         unsafe { command_buffer_builder.draw(self.vertex_buffer.len() as u32, 1, 0, 0) }.unwrap()
             .end_render_pass(Default::default()).ok();
 
-
         // Submit command buffer, present when previous frame ends and image becomes available,
         // then signal fence once presentation is finished
         let command_buffer = command_buffer_builder.build().unwrap();
+
+        // Check if we should wait on a previous frame
+        if let Some(_) = &self.previous_frame_end
+        {
+            // Wait until previous frame has finished so that buffers/resources can be updated
+            self.previous_frame_end.as_mut().unwrap().wait(None).unwrap();
+
+            // Cleanup finished futures
+            self.previous_frame_end.as_mut().unwrap().cleanup_finished();
+        }
+
+        // Update necessary buffers before execution
+        self.update_view_projection_buffer();
+
         let swapchain_present_info =
             SwapchainPresentInfo::swapchain_image_index(self.swapchain.clone(), image_index);
 
-        let present_fence = self.previous_frame_end
-            .take()
-            .unwrap()
+        // Execute command buffer, present, and then signal fence
+        let present_fence = sync::now(self.device.clone())
             .join(acquire_future)
             .then_execute(self.queue.clone(), command_buffer)
             .unwrap()
@@ -294,21 +374,54 @@ impl GfxApi
         {
             Ok(present_fence) =>
                 {
-                    self.previous_frame_end = Some(present_fence.boxed());
+                    self.previous_frame_end = Some(present_fence);
                 }
 
             Err(VulkanError::OutOfDate) =>
                 {
                     self.should_recreate_swapchain = true;
-                    self.previous_frame_end = Some(sync::now(self.device.clone()).boxed());
+                    self.previous_frame_end = None;
                 }
 
             Err(err) =>
                 {
                     println!("Failed to flush present fence: {err}");
-                    self.previous_frame_end = Some(sync::now(self.device.clone()).boxed());
+                    self.previous_frame_end = None;
                 }
         }
+    }
+
+    /// Update current view-perspective matrices for rendering
+    pub fn update_camera(&mut self, view_matrix: [[f32; 4]; 4], perspective_matrix: [[f32; 4]; 4])
+    {
+        // Need to flip Y axis of projection matrix to match Vulkan's viewport coordinates
+        // (glam library calculates a perspective matrix meant for OpenGL)
+        let mut flipped_perspective_matrix = perspective_matrix;
+        flipped_perspective_matrix[1][1] *= -1.0;
+
+        self.view_projection_data = ViewProjectionData
+        {
+            view_matrix,
+            perspective_matrix: flipped_perspective_matrix,
+        };
+    }
+
+    /// Update view-projection buffer data from latest camera update
+    /// # Panics
+    /// Will panic if this is called while the GPU is using the uniform buffer
+    /// Need to wait until the previous frame is finished processing before calling this function
+    fn update_view_projection_buffer(&mut self)
+    {
+        let mut buffer_write = self.view_perspective_data_buffer.write().unwrap();
+        *buffer_write = self.view_projection_data.clone();
+
+        self.view_perspective_data_descriptor_set = DescriptorSet::new(
+            self.descriptor_set_allocator.clone(),
+            self.graphics_pipeline.layout().set_layouts().get(0).unwrap().clone(),
+            [WriteDescriptorSet::buffer(0, self.view_perspective_data_buffer.clone())],
+            []
+        )
+        .expect("Failed to update view projection data buffer");
     }
 
     /// Find the best physical device that supports required extensions
@@ -371,9 +484,9 @@ impl GfxApi
         // Hard-code triangle vertices for now
         let vertices =
         [
-            VertexData { position: [0.5, -0.5], color: [1.0, 0.0, 0.0] },
-            VertexData { position: [0.5, 0.5], color: [0.0, 1.0, 0.0] },
-            VertexData { position: [-0.5, -0.5], color: [0.0, 0.0, 1.0] },
+            VertexData { position: [0.5, -0.5, 0.0], color: [1.0, 0.0, 0.0] },
+            VertexData { position: [0.5, 0.5, 0.0], color: [0.0, 1.0, 0.0] },
+            VertexData { position: [-0.5, -0.5, 0.0], color: [0.0, 0.0, 1.0] },
         ];
 
         let buffer_create_info = BufferCreateInfo
@@ -394,6 +507,34 @@ impl GfxApi
             buffer_create_info,
             allocation_create_info,
             vertices
+        )
+        .unwrap()
+    }
+
+    /// Allocate view + perspective projection matrices data using given [MemoryAllocator]
+    fn allocate_view_perspective_data_buffer(
+        memory_allocator: Arc<dyn MemoryAllocator>,
+        view_projection_data: ViewProjectionData)
+        -> Subbuffer<ViewProjectionData>
+    {
+        let buffer_create_info = BufferCreateInfo
+        {
+            usage: BufferUsage::UNIFORM_BUFFER,
+            ..Default::default()
+        };
+
+        let allocation_create_info = AllocationCreateInfo
+        {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        };
+
+        Buffer::from_data(
+            memory_allocator,
+            buffer_create_info,
+            allocation_create_info,
+            view_projection_data,
         )
         .unwrap()
     }
@@ -426,7 +567,7 @@ impl GfxApi
         let rasterization_state = RasterizationState
         {
             cull_mode: CullMode::Back,
-            front_face: FrontFace::Clockwise,
+            front_face: FrontFace::CounterClockwise,
             ..Default::default()
         };
 
@@ -443,10 +584,39 @@ impl GfxApi
             PipelineShaderStageCreateInfo::new(frag_shader_entry_point),
         ];
 
-        let pipeline_layout_create_info =
-            PipelineDescriptorSetLayoutCreateInfo::from_stages(&pipeline_stages)
-                .into_pipeline_layout_create_info(device.clone())
-                .unwrap();
+        // Declare push constant range for objects' transform matrix,
+        // and descriptor set layout for view and perspective matrices,
+        // then pass to pipeline layout
+        let push_constant_range = PushConstantRange
+        {
+            stages: ShaderStages::VERTEX,
+            offset: 0,
+            size: size_of::<ObjectTransformData>() as u32,
+        };
+
+        let descriptor_set_layout_binding = DescriptorSetLayoutBinding
+        {
+            descriptor_type: DescriptorType::UniformBuffer,
+            descriptor_count: 1,
+            stages: ShaderStages::VERTEX,
+            ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
+        };
+
+        let descriptor_set_layout_create_info = DescriptorSetLayoutCreateInfo
+        {
+            bindings: BTreeMap::from([(0, descriptor_set_layout_binding)]),
+            ..DescriptorSetLayoutCreateInfo::default()
+        };
+
+        let descriptor_set_layout =
+            DescriptorSetLayout::new(device.clone(), descriptor_set_layout_create_info).unwrap();
+
+        let pipeline_layout_create_info = PipelineLayoutCreateInfo
+        {
+            push_constant_ranges: Vec::from([push_constant_range]),
+            set_layouts: Vec::from([descriptor_set_layout]),
+            ..PipelineLayoutCreateInfo::default()
+        };
 
         let pipeline_layout =
             PipelineLayout::new(device.clone(), pipeline_layout_create_info).unwrap();
