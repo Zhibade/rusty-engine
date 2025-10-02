@@ -4,7 +4,11 @@
 
 // Input vertex data
 layout(location = 0) in vec3 position;
-layout(location = 1) in vec3 color;
+layout(location = 1) in vec3 normals;
+layout(location = 2) in vec3 tangents;
+layout(location = 3) in vec3 uv0;
+layout(location = 4) in vec3 uv1;
+layout(location = 5) in vec3 color;
 
 // Extra output vertex data
 layout(location = 0) out vec3 v_color;
