@@ -9,11 +9,16 @@ use std::mem::size_of;
 use std::path::Path;
 use std::sync::Arc;
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
-use vulkano::command_buffer::allocator::{
-    StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo,
-};
 use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferExecFuture, CommandBufferUsage, RenderPassBeginInfo,
+    AutoCommandBufferBuilder,
+    CommandBufferExecFuture,
+    CommandBufferUsage,
+    CopyBufferInfo,
+    PrimaryCommandBufferAbstract,
+    RenderPassBeginInfo,
+};
+use vulkano::command_buffer::allocator::{
+    StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo
 };
 use vulkano::descriptor_set::allocator::{
     StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo,
@@ -53,7 +58,7 @@ use vulkano::swapchain::{
 };
 use vulkano::sync::future::{FenceSignalFuture, JoinFuture, NowFuture};
 use vulkano::sync::{self, GpuFuture};
-use vulkano::{Validated, Version, VulkanError};
+use vulkano::{DeviceSize, Validated, Version, VulkanError};
 use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
@@ -271,9 +276,13 @@ impl GfxApi {
 
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
-        // Allocate hard-coded triangle mesh and set position
-        let (vertex_buffer, index_buffer) =
-            Self::allocate_vertex_data_buffers(memory_allocator.clone(), &mesh);
+        // Allocate hard-coded mesh and set position
+        let (vertex_buffer, index_buffer) = Self::allocate_vertex_data_buffers(
+            memory_allocator.clone(),
+            command_buffer_allocator.clone(),
+            queue.clone(),
+            &mesh,
+        );
 
         let object_transform_data = ObjectTransformData {
             matrix: Mat4::IDENTITY.to_cols_array_2d(),
@@ -528,9 +537,11 @@ impl GfxApi {
         Vec::new()
     }
 
-    /// Allocate vertex and index buffers using given [MemoryAllocator] and [Mesh]
+    /// Allocate vertex and index buffers on the device using given [Mesh] data
     fn allocate_vertex_data_buffers(
         memory_allocator: Arc<dyn MemoryAllocator>,
+        command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+        queue: Arc<Queue>,
         mesh: &Mesh,
     ) -> (Subbuffer<[VertexData]>, Subbuffer<[u32]>) {
         // Get vertex data from mesh
@@ -548,39 +559,95 @@ impl GfxApi {
             vertices.push(data);
         }
 
-        // Create vertex buffer
-        let vertex_buffer_create_info = BufferCreateInfo {
-            usage: BufferUsage::VERTEX_BUFFER,
+        let num_of_vertices = vertices.len();
+
+        // Since data won't change frequently, using device local buffers is more performant
+        // However, need a staging buffer first to store the data and then send it to the GPU
+        let staging_buffer_create_info = BufferCreateInfo
+        {
+            usage: BufferUsage::TRANSFER_SRC,
             ..Default::default()
         };
 
-        let allocation_create_info = AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+        let staging_allocation_create_info = AllocationCreateInfo
+        {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
         };
 
-        let vertex_buffer = Buffer::from_iter(
+        let device_local_allocation_create_info = AllocationCreateInfo
+        {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        };
+
+        // Create vertex buffers (staging and device local)
+        let vertex_staging_buffer = Buffer::from_iter(
             memory_allocator.clone(),
-            vertex_buffer_create_info,
-            allocation_create_info.clone(),
+            staging_buffer_create_info.clone(),
+            staging_allocation_create_info.clone(),
             vertices,
         )
         .unwrap();
 
-        // Create index buffer
-        let index_buffer_create_info = BufferCreateInfo {
-            usage: BufferUsage::INDEX_BUFFER,
+        let vertex_buffer_create_info = BufferCreateInfo
+        {
+            usage: BufferUsage::VERTEX_BUFFER | BufferUsage::TRANSFER_DST,
             ..Default::default()
         };
 
-        let index_buffer = Buffer::from_iter(
-            memory_allocator,
-            index_buffer_create_info,
-            allocation_create_info,
+        let vertex_buffer = Buffer::new_slice::<VertexData>(
+            memory_allocator.clone(),
+            vertex_buffer_create_info,
+            device_local_allocation_create_info.clone(),
+            num_of_vertices as DeviceSize,
+        )
+        .unwrap();
+
+        // Create index buffer
+        let index_staging_buffer = Buffer::from_iter(
+            memory_allocator.clone(),
+            staging_buffer_create_info,
+            staging_allocation_create_info,
             mesh.indices.clone(),
         )
         .unwrap();
+
+        let index_buffer_create_info = BufferCreateInfo {
+            usage: BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        };
+
+        let index_buffer = Buffer::new_slice::<u32>(
+            memory_allocator,
+            index_buffer_create_info,
+            device_local_allocation_create_info,
+            mesh.indices.len() as DeviceSize,
+        )
+        .unwrap();
+
+        // Copy buffers to GPU using a temporary command buffer
+        let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
+            command_buffer_allocator,
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap();
+
+        let vertex_copy_buffer_info =
+            CopyBufferInfo::buffers(vertex_staging_buffer, vertex_buffer.clone());
+
+        let index_copy_buffer_info =
+            CopyBufferInfo::buffers(index_staging_buffer, index_buffer.clone());
+
+        command_buffer_builder.copy_buffer(vertex_copy_buffer_info).unwrap()
+            .copy_buffer(index_copy_buffer_info).unwrap();
+
+        command_buffer_builder.build().unwrap()
+            .execute(queue).expect("Failed to execute command buffer")
+            .then_signal_fence_and_flush().unwrap()
+            .wait(None).unwrap(); // Block until copy is executed
 
         (vertex_buffer, index_buffer)
     }
