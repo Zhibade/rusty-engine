@@ -9,16 +9,12 @@ use std::mem::size_of;
 use std::path::Path;
 use std::sync::Arc;
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
-use vulkano::command_buffer::{
-    AutoCommandBufferBuilder,
-    CommandBufferExecFuture,
-    CommandBufferUsage,
-    CopyBufferInfo,
-    PrimaryCommandBufferAbstract,
-    RenderPassBeginInfo,
-};
 use vulkano::command_buffer::allocator::{
-    StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo
+    StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo,
+};
+use vulkano::command_buffer::{
+    AutoCommandBufferBuilder, CommandBufferExecFuture, CommandBufferUsage, CopyBufferInfo,
+    PrimaryCommandBufferAbstract, RenderPassBeginInfo,
 };
 use vulkano::descriptor_set::allocator::{
     StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo,
@@ -31,6 +27,7 @@ use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
 };
+use vulkano::format::{Format, FormatFeatures};
 use vulkano::image::view::ImageView;
 use vulkano::image::{Image, ImageCreateInfo, ImageLayout, ImageTiling, ImageUsage};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions};
@@ -40,6 +37,7 @@ use vulkano::memory::allocator::{
 };
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
+use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace, RasterizationState};
@@ -59,8 +57,6 @@ use vulkano::swapchain::{
 use vulkano::sync::future::{FenceSignalFuture, JoinFuture, NowFuture};
 use vulkano::sync::{self, GpuFuture};
 use vulkano::{DeviceSize, Validated, Version, VulkanError};
-use vulkano::format::{Format, FormatFeatures};
-use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
 use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
@@ -68,7 +64,8 @@ use winit::window::Window;
 /// Object's transform data (passed as a push constant)
 #[derive(BufferContents, Clone, Default)]
 #[repr(C)]
-struct ObjectTransformData {
+struct ObjectTransformData
+{
     matrix: [[f32; 4]; 4],
 }
 
@@ -76,7 +73,8 @@ struct ObjectTransformData {
 /// Support for two UV sets only for now
 #[derive(BufferContents, Vertex)]
 #[repr(C)]
-struct VertexData {
+struct VertexData
+{
     #[format(R32G32B32_SFLOAT)]
     position: [f32; 3],
 
@@ -99,14 +97,16 @@ struct VertexData {
 /// View + perspective projection matrices (passed as a uniform buffer)
 #[derive(BufferContents, Clone, Default)]
 #[repr(C)]
-struct ViewProjectionData {
+struct ViewProjectionData
+{
     view_matrix: [[f32; 4]; 4],
     perspective_matrix: [[f32; 4]; 4],
 }
 
 /// Graphics API interface
 /// Only Vulkan is supported at the moment
-pub struct GfxApi {
+pub struct GfxApi
+{
     // Base objects/data needed for drawing
     device: Arc<Device>,
     queue: Arc<Queue>,
@@ -142,10 +142,12 @@ pub struct GfxApi {
     // TODO: Might be able to improve it through a different API?
 }
 
-impl GfxApi {
+impl GfxApi
+{
     /// Create and initialize a new graphics API instance
     /// API will be ready after being created, only need to call [render] method
-    pub fn new(event_loop: &ActiveEventLoop, window: Arc<Window>, mesh: Mesh) -> Self {
+    pub fn new(event_loop: &ActiveEventLoop, window: Arc<Window>, mesh: Mesh) -> Self
+    {
         // Init Vulkan library
         let library = VulkanLibrary::new().expect("Vulkan library creation failed");
 
@@ -364,15 +366,18 @@ impl GfxApi {
 
     /// Notify graphics API that window has been resized so that it updates its rendering
     /// state to match the new window size
-    pub fn on_window_resized(&mut self, new_size: PhysicalSize<u32>) {
+    pub fn on_window_resized(&mut self, new_size: PhysicalSize<u32>)
+    {
         self.should_recreate_swapchain = true;
         self.window_size = new_size.into();
     }
 
     /// Record and execute rendering commands once the next frame image is ready
-    pub fn render(&mut self) {
+    pub fn render(&mut self)
+    {
         // If needed, recreate swapchain and framebuffers before rendering
-        if self.should_recreate_swapchain {
+        if self.should_recreate_swapchain
+        {
             self.recreate_swapchain();
         }
 
@@ -382,7 +387,8 @@ impl GfxApi {
                 .expect("Failed to acquire next image from swapchain");
 
         // Update swapchain if properties don't match the surface's properties
-        if suboptimal {
+        if suboptimal
+        {
             self.should_recreate_swapchain = true;
         }
 
@@ -397,7 +403,7 @@ impl GfxApi {
         let render_pass_begin_info = RenderPassBeginInfo {
             clear_values: Vec::from([
                 Some([0.1, 0.1, 0.1, 1.0].into()), // Color
-                Some((1.0, 0).into()), // Depth + stencil
+                Some((1.0, 0).into()),             // Depth + stencil
             ]),
             ..RenderPassBeginInfo::framebuffer(self.framebuffers[image_index as usize].clone())
         };
@@ -437,7 +443,8 @@ impl GfxApi {
         let command_buffer = command_buffer_builder.build().unwrap();
 
         // Check if we should wait on a previous frame
-        if let Some(_) = &self.previous_frame_end {
+        if let Some(_) = &self.previous_frame_end
+        {
             // Wait until previous frame has finished so that buffers/resources can be updated
             self.previous_frame_end
                 .as_mut()
@@ -464,17 +471,21 @@ impl GfxApi {
             .then_signal_fence_and_flush();
 
         // Check fence's result once it is finished
-        match present_fence.map_err(Validated::unwrap) {
-            Ok(present_fence) => {
+        match present_fence.map_err(Validated::unwrap)
+        {
+            Ok(present_fence) =>
+            {
                 self.previous_frame_end = Some(present_fence);
             }
 
-            Err(VulkanError::OutOfDate) => {
+            Err(VulkanError::OutOfDate) =>
+            {
                 self.should_recreate_swapchain = true;
                 self.previous_frame_end = None;
             }
 
-            Err(err) => {
+            Err(err) =>
+            {
                 println!("Failed to flush present fence: {err}");
                 self.previous_frame_end = None;
             }
@@ -482,7 +493,8 @@ impl GfxApi {
     }
 
     /// Update current view-perspective matrices for rendering
-    pub fn update_camera(&mut self, view_matrix: [[f32; 4]; 4], perspective_matrix: [[f32; 4]; 4]) {
+    pub fn update_camera(&mut self, view_matrix: [[f32; 4]; 4], perspective_matrix: [[f32; 4]; 4])
+    {
         // Need to flip Y axis of projection matrix to match Vulkan's viewport coordinates
         // (glam library calculates a perspective matrix meant for OpenGL)
         let mut flipped_perspective_matrix = perspective_matrix;
@@ -498,7 +510,8 @@ impl GfxApi {
     /// # Panics
     /// Will panic if this is called while the GPU is using the uniform buffer
     /// Need to wait until the previous frame is finished processing before calling this function
-    fn update_view_projection_buffer(&mut self) {
+    fn update_view_projection_buffer(&mut self)
+    {
         let mut buffer_write = self.view_perspective_data_buffer.write().unwrap();
         *buffer_write = self.view_projection_data.clone();
 
@@ -524,13 +537,15 @@ impl GfxApi {
         instance: &Arc<Instance>,
         event_loop: &ActiveEventLoop,
         device_extensions: &DeviceExtensions,
-    ) -> (Arc<PhysicalDevice>, u32) {
+    ) -> (Arc<PhysicalDevice>, u32)
+    {
         let (physical_device, queue_family_index) = instance
             .enumerate_physical_devices()
             .unwrap()
             .filter_map(|device| {
                 // Check if it supports required extensions and queue family
-                if device.supported_extensions().contains(&device_extensions) {
+                if device.supported_extensions().contains(&device_extensions)
+                {
                     device
                         .queue_family_properties()
                         .iter()
@@ -540,13 +555,16 @@ impl GfxApi {
                                 && device.presentation_support(i as u32, event_loop).unwrap()
                         })
                         .map(|index| (device, index as u32))
-                } else {
+                }
+                else
+                {
                     None
                 }
             })
             .min_by_key(|(device, _)| {
                 // Find the best candidate based on the priority below
-                match device.properties().device_type {
+                match device.properties().device_type
+                {
                     PhysicalDeviceType::DiscreteGpu => 0,
                     PhysicalDeviceType::IntegratedGpu => 1,
                     PhysicalDeviceType::VirtualGpu => 2,
@@ -585,7 +603,8 @@ impl GfxApi {
             {
                 let format_properties = physical_device.format_properties(format).unwrap();
 
-                let tiling_features = match tiling_method {
+                let tiling_features = match tiling_method
+                {
                     ImageTiling::Optimal => format_properties.optimal_tiling_features,
                     ImageTiling::Linear => format_properties.linear_tiling_features,
                     _ => format_properties.optimal_tiling_features,
@@ -614,8 +633,10 @@ impl GfxApi {
     }
 
     /// Get validation layers to be used depending on build configuration
-    fn get_enabled_layers() -> Vec<String> {
-        if cfg!(debug_assertions) {
+    fn get_enabled_layers() -> Vec<String>
+    {
+        if cfg!(debug_assertions)
+        {
             return Vec::from([String::from("VK_LAYER_KHRONOS_validation")]);
         }
 
@@ -628,10 +649,12 @@ impl GfxApi {
         command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
         queue: Arc<Queue>,
         mesh: &Mesh,
-    ) -> (Subbuffer<[VertexData]>, Subbuffer<[u32]>) {
+    ) -> (Subbuffer<[VertexData]>, Subbuffer<[u32]>)
+    {
         // Get vertex data from mesh
         let mut vertices: Vec<VertexData> = Vec::with_capacity(mesh.vertices.len());
-        for (i, vertex) in mesh.vertices.iter().enumerate() {
+        for (i, vertex) in mesh.vertices.iter().enumerate()
+        {
             let data = VertexData {
                 position: vertex.to_array(),
                 normals: mesh.normals[i].to_array(),
@@ -648,21 +671,18 @@ impl GfxApi {
 
         // Since data won't change frequently, using device local buffers is more performant
         // However, need a staging buffer first to store the data and then send it to the GPU
-        let staging_buffer_create_info = BufferCreateInfo
-        {
+        let staging_buffer_create_info = BufferCreateInfo {
             usage: BufferUsage::TRANSFER_SRC,
             ..Default::default()
         };
 
-        let staging_allocation_create_info = AllocationCreateInfo
-        {
+        let staging_allocation_create_info = AllocationCreateInfo {
             memory_type_filter: MemoryTypeFilter::PREFER_HOST
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
         };
 
-        let device_local_allocation_create_info = AllocationCreateInfo
-        {
+        let device_local_allocation_create_info = AllocationCreateInfo {
             memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
             ..Default::default()
         };
@@ -676,8 +696,7 @@ impl GfxApi {
         )
         .unwrap();
 
-        let vertex_buffer_create_info = BufferCreateInfo
-        {
+        let vertex_buffer_create_info = BufferCreateInfo {
             usage: BufferUsage::VERTEX_BUFFER | BufferUsage::TRANSFER_DST,
             ..Default::default()
         };
@@ -726,13 +745,21 @@ impl GfxApi {
         let index_copy_buffer_info =
             CopyBufferInfo::buffers(index_staging_buffer, index_buffer.clone());
 
-        command_buffer_builder.copy_buffer(vertex_copy_buffer_info).unwrap()
-            .copy_buffer(index_copy_buffer_info).unwrap();
+        command_buffer_builder
+            .copy_buffer(vertex_copy_buffer_info)
+            .unwrap()
+            .copy_buffer(index_copy_buffer_info)
+            .unwrap();
 
-        command_buffer_builder.build().unwrap()
-            .execute(queue).expect("Failed to execute command buffer")
-            .then_signal_fence_and_flush().unwrap()
-            .wait(None).unwrap(); // Block until copy is executed
+        command_buffer_builder
+            .build()
+            .unwrap()
+            .execute(queue)
+            .expect("Failed to execute command buffer")
+            .then_signal_fence_and_flush()
+            .unwrap()
+            .wait(None)
+            .unwrap(); // Block until copy is executed
 
         (vertex_buffer, index_buffer)
     }
@@ -741,7 +768,8 @@ impl GfxApi {
     fn allocate_view_perspective_data_buffer(
         memory_allocator: Arc<dyn MemoryAllocator>,
         view_projection_data: ViewProjectionData,
-    ) -> Subbuffer<ViewProjectionData> {
+    ) -> Subbuffer<ViewProjectionData>
+    {
         let buffer_create_info = BufferCreateInfo {
             usage: BufferUsage::UNIFORM_BUFFER,
             ..Default::default()
@@ -769,7 +797,8 @@ impl GfxApi {
         render_pass: &Arc<RenderPass>,
         vert_shader_entry_point: EntryPoint,
         frag_shader_entry_point: EntryPoint,
-    ) -> Arc<GraphicsPipeline> {
+    ) -> Arc<GraphicsPipeline>
+    {
         let vertex_input_state = VertexData::per_vertex()
             .definition(&vert_shader_entry_point)
             .unwrap();
@@ -795,8 +824,7 @@ impl GfxApi {
             ..Default::default()
         };
 
-        let depth_stencil_state = DepthStencilState
-        {
+        let depth_stencil_state = DepthStencilState {
             depth: Some(DepthState::simple()),
             ..Default::default()
         };
@@ -866,7 +894,8 @@ impl GfxApi {
         images: &Vec<Arc<Image>>,
         render_pass: &Arc<RenderPass>,
         depth_stencil_format: Format,
-    ) -> Vec<Arc<Framebuffer>> {
+    ) -> Vec<Arc<Framebuffer>>
+    {
         let mut framebuffers = Vec::new();
 
         // Create a framebuffer per swapchain image
@@ -876,8 +905,7 @@ impl GfxApi {
             let image_view = ImageView::new_default(image.clone()).unwrap();
 
             // Create depth-stencil image per frame buffer
-            let depth_stencil_image_create_info = ImageCreateInfo
-            {
+            let depth_stencil_image_create_info = ImageCreateInfo {
                 format: depth_stencil_format,
                 extent: image.extent(),
                 usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
@@ -885,8 +913,7 @@ impl GfxApi {
                 ..Default::default()
             };
 
-            let depth_stencil_allocation_info = AllocationCreateInfo
-            {
+            let depth_stencil_allocation_info = AllocationCreateInfo {
                 memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
                 ..Default::default()
             };
@@ -895,14 +922,14 @@ impl GfxApi {
                 memory_allocator.clone(),
                 depth_stencil_image_create_info,
                 depth_stencil_allocation_info,
-            ).expect("Failed to create depth stencil image");
+            )
+            .expect("Failed to create depth stencil image");
 
             let depth_stencil_image_view =
                 ImageView::new_default(depth_stencil_image.clone()).unwrap();
 
             // Create framebuffer
-            let framebuffer_create_info = FramebufferCreateInfo
-            {
+            let framebuffer_create_info = FramebufferCreateInfo {
                 attachments: Vec::from([image_view, depth_stencil_image_view]),
                 ..Default::default()
             };
@@ -924,11 +951,13 @@ impl GfxApi {
         device: Arc<Device>,
         vert_shader_path: impl AsRef<Path>,
         frag_shader_path: impl AsRef<Path>,
-    ) -> (EntryPoint, EntryPoint) {
+    ) -> (EntryPoint, EntryPoint)
+    {
         let paths = Vec::from([vert_shader_path.as_ref(), frag_shader_path.as_ref()]);
         let mut entry_points = Vec::new();
 
-        for path in paths {
+        for path in paths
+        {
             let filepath = Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
 
             let mut bytes = Vec::new();
@@ -960,7 +989,8 @@ impl GfxApi {
     }
 
     /// Recreate swapchain to match new surface's properties
-    fn recreate_swapchain(&mut self) {
+    fn recreate_swapchain(&mut self)
+    {
         // Recreate swapchain to match new window size
         let swapchain_create_info = SwapchainCreateInfo {
             image_extent: self.window_size,
@@ -991,8 +1021,10 @@ impl GfxApi {
 
     /// Utility function for converting device type to a string slice for logging
     #[cfg(debug_assertions)]
-    fn get_device_type_name(device_type: &PhysicalDeviceType) -> &str {
-        match device_type {
+    fn get_device_type_name(device_type: &PhysicalDeviceType) -> &str
+    {
+        match device_type
+        {
             PhysicalDeviceType::DiscreteGpu => "Discrete GPU",
             PhysicalDeviceType::IntegratedGpu => "Integrated GPU",
             PhysicalDeviceType::VirtualGpu => "Virtual GPU",
@@ -1021,10 +1053,12 @@ impl GfxApi {
 
     /// Debug log the required Vulkan instance extensions
     #[cfg(debug_assertions)]
-    fn log_required_extensions(required_extensions: &InstanceExtensions) {
+    fn log_required_extensions(required_extensions: &InstanceExtensions)
+    {
         println!("Required Extensions:");
 
-        for extension in required_extensions.into_iter() {
+        for extension in required_extensions.into_iter()
+        {
             println!("{}", extension.0);
         }
 

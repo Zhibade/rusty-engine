@@ -5,7 +5,8 @@ mod components;
 mod gfx_api;
 mod loaders;
 
-fn main() {
+fn main()
+{
     let mut app = app::App::default();
     app.run();
 }
