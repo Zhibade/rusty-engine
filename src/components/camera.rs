@@ -19,7 +19,7 @@ impl Camera {
 
         let view_matrix = Mat4::look_at_lh(
             translation,
-            camera.transform.z_axis.truncate(),
+            translation + camera.transform.z_axis.truncate(),
             camera.transform.y_axis.truncate(),
         );
 

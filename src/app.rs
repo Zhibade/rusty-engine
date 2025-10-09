@@ -62,7 +62,7 @@ impl ApplicationHandler for App {
                 let (view_matrix, projection_matrix) = Camera::get_view_projection_matrices(
                     &self.camera,
                     self.window.as_ref().unwrap().inner_size().into(),
-                    [0.0, 10000.0],
+                    [0.01, 100.0],
                 );
 
                 self.gfx_api
