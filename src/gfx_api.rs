@@ -32,7 +32,7 @@ use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
 };
 use vulkano::image::view::ImageView;
-use vulkano::image::{Image, ImageUsage};
+use vulkano::image::{Image, ImageCreateInfo, ImageLayout, ImageTiling, ImageUsage};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions};
 use vulkano::library::VulkanLibrary;
 use vulkano::memory::allocator::{
@@ -59,6 +59,8 @@ use vulkano::swapchain::{
 use vulkano::sync::future::{FenceSignalFuture, JoinFuture, NowFuture};
 use vulkano::sync::{self, GpuFuture};
 use vulkano::{DeviceSize, Validated, Version, VulkanError};
+use vulkano::format::{Format, FormatFeatures};
+use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
 use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
@@ -105,7 +107,7 @@ struct ViewProjectionData {
 /// Graphics API interface
 /// Only Vulkan is supported at the moment
 pub struct GfxApi {
-    // Common application objects that are accessed at many different points of the application
+    // Base objects/data needed for drawing
     device: Arc<Device>,
     queue: Arc<Queue>,
     swapchain: Arc<Swapchain>,
@@ -113,6 +115,10 @@ pub struct GfxApi {
     render_pass: Arc<RenderPass>,
     graphics_pipeline: Arc<GraphicsPipeline>,
     framebuffers: Vec<Arc<Framebuffer>>,
+    depth_stencil_format: Format,
+
+    // Memory allocators
+    memory_allocator: Arc<dyn MemoryAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
 
@@ -133,7 +139,7 @@ pub struct GfxApi {
         >,
     >,
     // ^ Need this ridiculous nested type to be able to use FenceSignalFuture's API
-    // TODO: Might be able to improve it through different API?
+    // TODO: Might be able to improve it through a different API?
 }
 
 impl GfxApi {
@@ -230,6 +236,13 @@ impl GfxApi {
         let (vert_shader_entry_point, frag_shader_entry_point) =
             Self::load_shaders(device.clone(), vert_shader_path, frag_shader_path);
 
+        // Find best depth buffer format
+        let depth_stencil_format =
+            Self::get_best_supported_depth_buffer_format(device.physical_device());
+
+        #[cfg(debug_assertions)]
+        Self::log_depth_stencil_format(&depth_stencil_format);
+
         // Create single pass render pass
         let render_pass = vulkano::single_pass_renderpass!(
             device.clone(),
@@ -240,8 +253,17 @@ impl GfxApi {
                     load_op: Clear,
                     store_op: Store,
                 },
+                depth_stencil: {
+                    format: depth_stencil_format,
+                    samples: 1,
+                    load_op: Clear,
+                    store_op: DontCare,
+                },
             },
-            pass: { color: [color], depth_stencil: {} },
+            pass: {
+                color: [color],
+                depth_stencil: { depth_stencil },
+            },
         )
         .unwrap();
 
@@ -260,9 +282,6 @@ impl GfxApi {
             frag_shader_entry_point,
         );
 
-        // Create matching framebuffers for swapchain images
-        let framebuffers = Self::create_framebuffers(&swapchain_images, &render_pass);
-
         // Create memory allocators
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
             device.clone(),
@@ -275,6 +294,14 @@ impl GfxApi {
         ));
 
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
+
+        // Create matching framebuffers for swapchain images
+        let framebuffers = Self::create_framebuffers(
+            memory_allocator.clone(),
+            &swapchain_images,
+            &render_pass,
+            depth_stencil_format,
+        );
 
         // Allocate hard-coded mesh and set position
         let (vertex_buffer, index_buffer) = Self::allocate_vertex_data_buffers(
@@ -291,7 +318,7 @@ impl GfxApi {
         // Allocate view and perspective projection data
         let view_projection_data = ViewProjectionData::default();
         let view_perspective_data_buffer = Self::allocate_view_perspective_data_buffer(
-            memory_allocator,
+            memory_allocator.clone(),
             view_projection_data.clone(),
         );
 
@@ -319,6 +346,8 @@ impl GfxApi {
             render_pass,
             graphics_pipeline,
             framebuffers,
+            depth_stencil_format,
+            memory_allocator,
             command_buffer_allocator,
             descriptor_set_allocator,
             vertex_buffer,
@@ -366,7 +395,10 @@ impl GfxApi {
         .expect("Failed to create command buffer builder");
 
         let render_pass_begin_info = RenderPassBeginInfo {
-            clear_values: Vec::from([Some([0.1, 0.1, 0.1, 1.0].into())]),
+            clear_values: Vec::from([
+                Some([0.1, 0.1, 0.1, 1.0].into()), // Color
+                Some((1.0, 0).into()), // Depth + stencil
+            ]),
             ..RenderPassBeginInfo::framebuffer(self.framebuffers[image_index as usize].clone())
         };
 
@@ -526,6 +558,59 @@ impl GfxApi {
             .expect("No suitable physical device found");
 
         (physical_device, queue_family_index)
+    }
+
+    /// Find the best supported format by the device for use as a depth buffer
+    /// # Panics
+    /// Will panic if physical device does not support any depth buffer format
+    fn get_best_supported_depth_buffer_format(physical_device: &Arc<PhysicalDevice>) -> Format
+    {
+        // Tiling methods to check, in order from best to worst
+        let tiling_methods = [ImageTiling::Optimal, ImageTiling::Linear];
+
+        // Depth formats to check, in order from best to worst
+        let depth_formats = [
+            Format::D32_SFLOAT_S8_UINT,
+            Format::D24_UNORM_S8_UINT,
+            Format::D16_UNORM_S8_UINT,
+            Format::D32_SFLOAT,
+            Format::D16_UNORM,
+        ];
+
+        let mut best_depth_format = None;
+
+        for tiling_method in tiling_methods
+        {
+            for format in depth_formats
+            {
+                let format_properties = physical_device.format_properties(format).unwrap();
+
+                let tiling_features = match tiling_method {
+                    ImageTiling::Optimal => format_properties.optimal_tiling_features,
+                    ImageTiling::Linear => format_properties.linear_tiling_features,
+                    _ => format_properties.optimal_tiling_features,
+                };
+
+                if tiling_features.contains(FormatFeatures::DEPTH_STENCIL_ATTACHMENT)
+                {
+                    best_depth_format = Some(format);
+                    break;
+                }
+            }
+
+            if best_depth_format.is_some()
+            {
+                break;
+            }
+        }
+
+        // If no format is found, panic
+        if best_depth_format.is_none()
+        {
+            panic!("No suitable depth buffer format found");
+        };
+
+        best_depth_format.unwrap()
     }
 
     /// Get validation layers to be used depending on build configuration
@@ -701,12 +786,18 @@ impl GfxApi {
 
         let rasterization_state = RasterizationState {
             cull_mode: CullMode::Back,
-            front_face: FrontFace::CounterClockwise,
+            front_face: FrontFace::Clockwise,
             ..Default::default()
         };
 
         let color_blend_state = ColorBlendState {
             attachments: Vec::from([ColorBlendAttachmentState::default()]),
+            ..Default::default()
+        };
+
+        let depth_stencil_state = DepthStencilState
+        {
+            depth: Some(DepthState::simple()),
             ..Default::default()
         };
 
@@ -758,6 +849,7 @@ impl GfxApi {
             rasterization_state: Some(rasterization_state),
             multisample_state: Some(MultisampleState::default()),
             color_blend_state: Some(color_blend_state),
+            depth_stencil_state: Some(depth_stencil_state),
             subpass: Some(subpass.into()),
             // Need to resize viewport if window is resized, so need to set as dynamic
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
@@ -770,16 +862,48 @@ impl GfxApi {
 
     /// Create a framebuffer per image and making them compatible with the given render pass
     fn create_framebuffers(
+        memory_allocator: Arc<dyn MemoryAllocator>,
         images: &Vec<Arc<Image>>,
         render_pass: &Arc<RenderPass>,
+        depth_stencil_format: Format,
     ) -> Vec<Arc<Framebuffer>> {
         let mut framebuffers = Vec::new();
 
-        for image in images {
+        // Create a framebuffer per swapchain image
+        for image in images
+        {
+            // Create image view from each frame buffer image
             let image_view = ImageView::new_default(image.clone()).unwrap();
 
-            let framebuffer_create_info = FramebufferCreateInfo {
-                attachments: Vec::from([image_view]),
+            // Create depth-stencil image per frame buffer
+            let depth_stencil_image_create_info = ImageCreateInfo
+            {
+                format: depth_stencil_format,
+                extent: image.extent(),
+                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
+                initial_layout: ImageLayout::Undefined,
+                ..Default::default()
+            };
+
+            let depth_stencil_allocation_info = AllocationCreateInfo
+            {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            };
+
+            let depth_stencil_image = Image::new(
+                memory_allocator.clone(),
+                depth_stencil_image_create_info,
+                depth_stencil_allocation_info,
+            ).expect("Failed to create depth stencil image");
+
+            let depth_stencil_image_view =
+                ImageView::new_default(depth_stencil_image.clone()).unwrap();
+
+            // Create framebuffer
+            let framebuffer_create_info = FramebufferCreateInfo
+            {
+                attachments: Vec::from([image_view, depth_stencil_image_view]),
                 ..Default::default()
             };
 
@@ -851,7 +975,12 @@ impl GfxApi {
         self.swapchain = new_swapchain;
 
         // Need to recreate framebuffers as well so that the swapchain references are updated
-        self.framebuffers = Self::create_framebuffers(&new_swapchain_images, &self.render_pass);
+        self.framebuffers = Self::create_framebuffers(
+            self.memory_allocator.clone(),
+            &new_swapchain_images,
+            &self.render_pass,
+            self.depth_stencil_format,
+        );
 
         // Update viewport size
         self.viewport.extent = self.window_size.map(|value| value as f32);
@@ -871,6 +1000,23 @@ impl GfxApi {
             PhysicalDeviceType::Other => "Other",
             _ => "Other",
         }
+    }
+
+    /// Debug log the depth stencil format
+    #[cfg(debug_assertions)]
+    fn log_depth_stencil_format(format: &Format)
+    {
+        let format_str = match format
+        {
+            Format::D32_SFLOAT_S8_UINT => "D32_SFLOAT_S8_UINT",
+            Format::D24_UNORM_S8_UINT => "D24_UNORM_S8_UINT",
+            Format::D16_UNORM_S8_UINT => "D16_UNORM_S8_UINT",
+            Format::D32_SFLOAT => "D32_SFLOAT",
+            Format::D16_UNORM => "D16_UNORM",
+            _ => "Unknown",
+        };
+
+        println!("Depth stencil format: {format_str}");
     }
 
     /// Debug log the required Vulkan instance extensions
