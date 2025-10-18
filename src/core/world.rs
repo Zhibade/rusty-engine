@@ -98,10 +98,7 @@ impl World
 
         if self.entities[entity_id].contains_key(&component_type)
         {
-            let generic_rc = self.entities[entity_id]
-                .get(&component_type)
-                .unwrap()
-                .clone();
+            let generic_rc = self.entities[entity_id].get(&component_type).unwrap().clone();
 
             Some(generic_rc.downcast::<RefCell<T>>().unwrap())
         }
@@ -118,14 +115,10 @@ impl World
         let type_id = TypeId::of::<T>();
 
         let component_cache_key = Vec::from([type_id]);
-        if self
-            .entity_component_cache
-            .contains_key(&component_cache_key)
+        if self.entity_component_cache.contains_key(&component_cache_key)
         {
-            let entities_with_component = self
-                .entity_component_cache
-                .get(&component_cache_key)
-                .unwrap();
+            let entities_with_component =
+                self.entity_component_cache.get(&component_cache_key).unwrap();
             entities_with_component.iter().for_each(|entity_id| {
                 if let Some(component) = self.get_component::<T>(entity_id.clone())
                 {
@@ -138,9 +131,7 @@ impl World
     }
 
     /// Query for all existing component pairs of the given types
-    pub fn query_pair<T: Component, U: Component>(
-        &self,
-    ) -> Vec<(Rc<RefCell<T>>, Rc<RefCell<U>>)>
+    pub fn query_pair<T: Component, U: Component>(&self) -> Vec<(Rc<RefCell<T>>, Rc<RefCell<U>>)>
     {
         let mut components = Vec::new();
         let type_id_t = TypeId::of::<T>();
@@ -150,15 +141,9 @@ impl World
         let mut component_cache_key = Vec::from([type_id_t, type_id_u]);
         component_cache_key.sort();
 
-        if self
-            .entity_component_cache
-            .contains_key(&component_cache_key)
+        if self.entity_component_cache.contains_key(&component_cache_key)
         {
-            for entity_id in self
-                .entity_component_cache
-                .get(&component_cache_key)
-                .unwrap()
-                .iter()
+            for entity_id in self.entity_component_cache.get(&component_cache_key).unwrap().iter()
             {
                 let component_t = self.get_component::<T>(entity_id.clone());
                 let component_u = self.get_component::<U>(entity_id.clone());
@@ -211,14 +196,10 @@ impl World
 
             if !self.entity_component_cache.contains_key(&component_types)
             {
-                self.entity_component_cache
-                    .insert(component_types.clone(), Vec::new());
+                self.entity_component_cache.insert(component_types.clone(), Vec::new());
             }
 
-            self.entity_component_cache
-                .get_mut(&component_types)
-                .unwrap()
-                .push(entity_id);
+            self.entity_component_cache.get_mut(&component_types).unwrap().push(entity_id);
         }
     }
 

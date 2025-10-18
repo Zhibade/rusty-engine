@@ -176,10 +176,8 @@ impl GfxApi
             Instance::new(library, instance_create_info).expect("Failed to create Vulkan instance");
 
         // Find the best physical device candidate and create a logical device for it
-        let device_extensions = DeviceExtensions {
-            khr_swapchain: true,
-            ..DeviceExtensions::empty()
-        };
+        let device_extensions =
+            DeviceExtensions { khr_swapchain: true, ..DeviceExtensions::empty() };
 
         let (physical_device, queue_family_index) =
             GfxApi::get_best_physical_device_and_queue(&instance, &event_loop, &device_extensions);
@@ -218,10 +216,8 @@ impl GfxApi
             .min_image_count
             .max(2); // Need at least two for fullscreen
 
-        let (image_format, _) = device
-            .physical_device()
-            .surface_formats(&surface, Default::default())
-            .unwrap()[0];
+        let (image_format, _) =
+            device.physical_device().surface_formats(&surface, Default::default()).unwrap()[0];
 
         let swapchain_create_info = SwapchainCreateInfo {
             min_image_count,
@@ -275,10 +271,7 @@ impl GfxApi
         .unwrap();
 
         // Create viewport
-        let viewport = Viewport {
-            extent: window.inner_size().into(),
-            ..Default::default()
-        };
+        let viewport = Viewport { extent: window.inner_size().into(), ..Default::default() };
 
         // Create graphics pipeline
         let graphics_pipeline = Self::create_graphics_pipeline(
@@ -319,16 +312,8 @@ impl GfxApi
 
         let view_perspective_data_descriptor_set = DescriptorSet::new(
             descriptor_set_allocator.clone(),
-            graphics_pipeline
-                .layout()
-                .set_layouts()
-                .get(0)
-                .unwrap()
-                .clone(),
-            [WriteDescriptorSet::buffer(
-                0,
-                view_perspective_data_buffer.clone(),
-            )],
+            graphics_pipeline.layout().set_layouts().get(0).unwrap().clone(),
+            [WriteDescriptorSet::buffer(0, view_perspective_data_buffer.clone())],
             [],
         )
         .unwrap();
@@ -381,17 +366,10 @@ impl GfxApi
             mesh,
         );
 
-        let transform_data = ObjectTransformData {
-            matrix: transform_matrix,
-        };
-        let render_mesh_data = RenderMeshData {
-            vertex_buffer,
-            index_buffer,
-            transform_data,
-        };
+        let transform_data = ObjectTransformData { matrix: transform_matrix };
+        let render_mesh_data = RenderMeshData { vertex_buffer, index_buffer, transform_data };
 
-        self.render_meshes_data
-            .insert(mesh.filepath.clone(), render_mesh_data);
+        self.render_meshes_data.insert(mesh.filepath.clone(), render_mesh_data);
     }
 
     /// Record and execute rendering commands once the next frame image is ready
@@ -476,11 +454,7 @@ impl GfxApi
         if let Some(_) = &self.previous_frame_end
         {
             // Wait until previous frame has finished so that buffers/resources can be updated
-            self.previous_frame_end
-                .as_mut()
-                .unwrap()
-                .wait(None)
-                .unwrap();
+            self.previous_frame_end.as_mut().unwrap().wait(None).unwrap();
 
             // Cleanup finished futures
             self.previous_frame_end.as_mut().unwrap().cleanup_finished();
@@ -530,10 +504,8 @@ impl GfxApi
         let mut flipped_perspective_matrix = perspective_matrix;
         flipped_perspective_matrix[1][1] *= -1.0;
 
-        self.view_projection_data = ViewProjectionData {
-            view_matrix,
-            perspective_matrix: flipped_perspective_matrix,
-        };
+        self.view_projection_data =
+            ViewProjectionData { view_matrix, perspective_matrix: flipped_perspective_matrix };
     }
 
     /// Update specific mesh's transform
@@ -543,11 +515,7 @@ impl GfxApi
     {
         if self.render_meshes_data.contains_key(filepath)
         {
-            self.render_meshes_data
-                .get_mut(filepath)
-                .unwrap()
-                .transform_data
-                .matrix = new_matrix;
+            self.render_meshes_data.get_mut(filepath).unwrap().transform_data.matrix = new_matrix;
         }
         else
         {
@@ -570,16 +538,8 @@ impl GfxApi
 
         self.view_perspective_data_descriptor_set = DescriptorSet::new(
             self.descriptor_set_allocator.clone(),
-            self.graphics_pipeline
-                .layout()
-                .set_layouts()
-                .get(0)
-                .unwrap()
-                .clone(),
-            [WriteDescriptorSet::buffer(
-                0,
-                self.view_perspective_data_buffer.clone(),
-            )],
+            self.graphics_pipeline.layout().set_layouts().get(0).unwrap().clone(),
+            [WriteDescriptorSet::buffer(0, self.view_perspective_data_buffer.clone())],
             [],
         )
         .expect("Failed to update view projection data buffer");
@@ -724,10 +684,8 @@ impl GfxApi
 
         // Since data won't change frequently, using device local buffers is more performant
         // However, need a staging buffer first to store the data and then send it to the GPU
-        let staging_buffer_create_info = BufferCreateInfo {
-            usage: BufferUsage::TRANSFER_SRC,
-            ..Default::default()
-        };
+        let staging_buffer_create_info =
+            BufferCreateInfo { usage: BufferUsage::TRANSFER_SRC, ..Default::default() };
 
         let staging_allocation_create_info = AllocationCreateInfo {
             memory_type_filter: MemoryTypeFilter::PREFER_HOST
@@ -823,10 +781,8 @@ impl GfxApi
         view_projection_data: ViewProjectionData,
     ) -> Subbuffer<ViewProjectionData>
     {
-        let buffer_create_info = BufferCreateInfo {
-            usage: BufferUsage::UNIFORM_BUFFER,
-            ..Default::default()
-        };
+        let buffer_create_info =
+            BufferCreateInfo { usage: BufferUsage::UNIFORM_BUFFER, ..Default::default() };
 
         let allocation_create_info = AllocationCreateInfo {
             memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
@@ -852,14 +808,10 @@ impl GfxApi
         frag_shader_entry_point: EntryPoint,
     ) -> Arc<GraphicsPipeline>
     {
-        let vertex_input_state = VertexData::per_vertex()
-            .definition(&vert_shader_entry_point)
-            .unwrap();
+        let vertex_input_state =
+            VertexData::per_vertex().definition(&vert_shader_entry_point).unwrap();
 
-        let scissor = Scissor {
-            offset: [0; 2],
-            extent: swapchain.image_extent(),
-        };
+        let scissor = Scissor { offset: [0; 2], extent: swapchain.image_extent() };
 
         let viewport_state = ViewportState {
             scissors: [scissor].into_iter().collect(),
@@ -877,10 +829,8 @@ impl GfxApi
             ..Default::default()
         };
 
-        let depth_stencil_state = DepthStencilState {
-            depth: Some(DepthState::simple()),
-            ..Default::default()
-        };
+        let depth_stencil_state =
+            DepthStencilState { depth: Some(DepthState::simple()), ..Default::default() };
 
         let subpass = Subpass::from(render_pass.clone(), 0).expect("Failed to create subpass");
 
@@ -1014,15 +964,11 @@ impl GfxApi
             let filepath = Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
 
             let mut bytes = Vec::new();
-            let mut file = File::open(&filepath).expect(&format!(
-                "Failed to open shader file {}",
-                filepath.to_str().unwrap()
-            ));
+            let mut file = File::open(&filepath)
+                .expect(&format!("Failed to open shader file {}", filepath.to_str().unwrap()));
 
-            file.read_to_end(&mut bytes).expect(&format!(
-                "Failed to read shader file {}",
-                filepath.to_str().unwrap()
-            ));
+            file.read_to_end(&mut bytes)
+                .expect(&format!("Failed to read shader file {}", filepath.to_str().unwrap()));
 
             let shader_words = vulkano::shader::spirv::bytes_to_words(&bytes)
                 .expect("Failed to read shader words from file {filepath}");
@@ -1045,15 +991,11 @@ impl GfxApi
     fn recreate_swapchain(&mut self)
     {
         // Recreate swapchain to match new window size
-        let swapchain_create_info = SwapchainCreateInfo {
-            image_extent: self.window_size,
-            ..self.swapchain.create_info()
-        };
+        let swapchain_create_info =
+            SwapchainCreateInfo { image_extent: self.window_size, ..self.swapchain.create_info() };
 
-        let (new_swapchain, new_swapchain_images) = self
-            .swapchain
-            .recreate(swapchain_create_info)
-            .expect("Failed to recreate swapchain");
+        let (new_swapchain, new_swapchain_images) =
+            self.swapchain.recreate(swapchain_create_info).expect("Failed to recreate swapchain");
 
         self.swapchain = new_swapchain;
 

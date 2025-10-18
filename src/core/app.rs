@@ -74,15 +74,12 @@ impl ApplicationHandler for App
     fn resumed(&mut self, event_loop: &ActiveEventLoop)
     {
         // Initialize window and graphics API on window startup
-        self.window = Some(Arc::new(
-            event_loop.create_window(Window::default_attributes()).unwrap(),
-        ));
+        self.window =
+            Some(Arc::new(event_loop.create_window(Window::default_attributes()).unwrap()));
 
         // Initialize the world
-        self.gfx_api = Some(Rc::new(RefCell::new(GfxApi::new(
-            event_loop,
-            self.window.clone().unwrap(),
-        ))));
+        self.gfx_api =
+            Some(Rc::new(RefCell::new(GfxApi::new(event_loop, self.window.clone().unwrap()))));
 
         self.init_world();
     }

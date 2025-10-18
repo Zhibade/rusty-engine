@@ -36,27 +36,17 @@ pub fn load_mesh(filepath: impl AsRef<Path>) -> Mesh
     }
 
     // Get first mesh's data
-    let mesh_data = gltf_file
-        .meshes()
-        .nth(0)
-        .unwrap()
-        .primitives()
-        .nth(0)
-        .unwrap();
+    let mesh_data = gltf_file.meshes().nth(0).unwrap().primitives().nth(0).unwrap();
     let mesh_data_reader = mesh_data.reader(|buffer| Some(&buffers[buffer.index()]));
 
-    let mut mesh = Mesh {
-        filepath: String::from(path_str),
-        has_been_initialized: false,
-        ..Mesh::default()
-    };
+    let mut mesh =
+        Mesh { filepath: String::from(path_str), has_been_initialized: false, ..Mesh::default() };
 
     // Positions
     if let Some(positions) = mesh_data_reader.read_positions()
     {
         positions.for_each(|position| {
-            mesh.vertices
-                .push(Vec3::new(position[0], position[1] * 1.0, position[2]));
+            mesh.vertices.push(Vec3::new(position[0], position[1] * 1.0, position[2]));
         });
     }
     else
@@ -77,10 +67,8 @@ pub fn load_mesh(filepath: impl AsRef<Path>) -> Mesh
     // Normals
     if let Some(normals) = mesh_data_reader.read_normals()
     {
-        normals.for_each(|normal| {
-            mesh.normals
-                .push(Vec3::new(normal[0], normal[1] * 1.0, normal[2]))
-        });
+        normals
+            .for_each(|normal| mesh.normals.push(Vec3::new(normal[0], normal[1] * 1.0, normal[2])));
     }
     else
     {
@@ -92,8 +80,7 @@ pub fn load_mesh(filepath: impl AsRef<Path>) -> Mesh
     if let Some(tangents) = mesh_data_reader.read_tangents()
     {
         tangents.for_each(|tangent| {
-            mesh.tangents
-                .push(Vec3::new(tangent[0], tangent[1] * 1.0, tangent[2]))
+            mesh.tangents.push(Vec3::new(tangent[0], tangent[1] * 1.0, tangent[2]))
         });
     }
     else

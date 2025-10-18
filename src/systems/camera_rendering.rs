@@ -20,10 +20,7 @@ impl CameraRenderingSystem
     /// Creates a new [CameraRenderingSystem] and passes the given graphics API and window size
     pub fn new(gfx_api: Rc<RefCell<GfxApi>>, window_size: [f32; 2]) -> Self
     {
-        CameraRenderingSystem {
-            gfx_api,
-            window_size,
-        }
+        CameraRenderingSystem { gfx_api, window_size }
     }
 }
 

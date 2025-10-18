@@ -40,10 +40,7 @@ impl Camera
             near_far_distance[1],
         );
 
-        (
-            view_matrix.to_cols_array_2d(),
-            projection_matrix.to_cols_array_2d(),
-        )
+        (view_matrix.to_cols_array_2d(), projection_matrix.to_cols_array_2d())
     }
 }
 
@@ -53,9 +50,6 @@ impl Default for Camera
     /// Creates a camera at the origin with an FOV of 60
     fn default() -> Self
     {
-        Camera {
-            is_active_camera: true,
-            fov: 60.0,
-        }
+        Camera { is_active_camera: true, fov: 60.0 }
     }
 }

@@ -18,9 +18,6 @@ impl Transform
     /// Create a new [Transform] component using the given position
     pub fn from_position(position: Vec3) -> Self
     {
-        Transform {
-            matrix: Mat4::from_translation(position),
-            has_been_changed: false,
-        }
+        Transform { matrix: Mat4::from_translation(position), has_been_changed: false }
     }
 }
