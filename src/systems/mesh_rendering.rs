@@ -2,9 +2,9 @@
 
 use crate::components::mesh::Mesh;
 use crate::components::transform::Transform;
+use crate::core::world::World;
 use crate::gfx_api::GfxApi;
 use crate::systems::system::System;
-use crate::world::World;
 use std::cell::RefCell;
 use std::ops::Deref;
 use std::rc::Rc;

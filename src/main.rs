@@ -1,14 +1,17 @@
 //! Rusty engine main entry point
 
-mod app;
 mod components;
+mod core;
 mod gfx_api;
 mod loaders;
 mod systems;
-mod world;
 
+// Includes
+use crate::core::app::App;
+
+// Program's entry point
 fn main()
 {
-    let mut app = app::App::default();
+    let mut app = App::default();
     app.run();
 }

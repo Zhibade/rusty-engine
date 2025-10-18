@@ -1,6 +1,6 @@
 //! System trait implementation
 
-use crate::world::World;
+use crate::core::world::World;
 
 /// Identifies a struct as a system
 ///

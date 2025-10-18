@@ -1,7 +1,7 @@
 //! World implementation
 
-use super::components::component::Component;
-use super::systems::system::System;
+use crate::components::component::Component;
+use crate::systems::system::System;
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::collections::HashMap;

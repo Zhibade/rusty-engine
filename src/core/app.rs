@@ -1,12 +1,12 @@
 //! Window application implementation
 
-use super::components::camera::Camera;
-use super::components::transform::Transform;
-use super::gfx_api::GfxApi;
-use super::loaders::mesh_loader;
-use super::systems::camera_rendering::CameraRenderingSystem;
-use super::systems::mesh_rendering::MeshRenderingSystem;
-use super::world::World;
+use crate::components::camera::Camera;
+use crate::components::transform::Transform;
+use crate::core::world::World;
+use crate::gfx_api::GfxApi;
+use crate::loaders::mesh_loader;
+use crate::systems::camera_rendering::CameraRenderingSystem;
+use crate::systems::mesh_rendering::MeshRenderingSystem;
 use glam::Vec3;
 use std::cell::RefCell;
 use std::rc::Rc;
