@@ -1,8 +1,7 @@
 //! Graphics API that will be used to render onto the application's window
 
 use super::components::mesh::Mesh;
-use glam::Mat4;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Read;
 use std::mem::size_of;
@@ -60,6 +59,14 @@ use vulkano::{DeviceSize, Validated, Version, VulkanError};
 use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
+
+/// Render mesh data after uploading to the GPU
+struct RenderMeshData
+{
+    vertex_buffer: Subbuffer<[VertexData]>,
+    index_buffer: Subbuffer<[u32]>,
+    transform_data: ObjectTransformData,
+}
 
 /// Object's transform data (passed as a push constant)
 #[derive(BufferContents, Clone, Default)]
@@ -123,10 +130,8 @@ pub struct GfxApi
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
 
     // Rendering data that will be used in the shaders
-    vertex_buffer: Subbuffer<[VertexData]>,
-    index_buffer: Subbuffer<[u32]>,
-    object_transform_data: ObjectTransformData, // Hard-coded object transform buffer
-    view_projection_data: ViewProjectionData,   // Current camera (view-projection) data
+    render_meshes_data: HashMap<String, RenderMeshData>,
+    view_projection_data: ViewProjectionData, // Current camera (view-projection) data
     view_perspective_data_buffer: Subbuffer<ViewProjectionData>,
     view_perspective_data_descriptor_set: Arc<DescriptorSet>,
 
@@ -146,7 +151,7 @@ impl GfxApi
 {
     /// Create and initialize a new graphics API instance
     /// API will be ready after being created, only need to call [render] method
-    pub fn new(event_loop: &ActiveEventLoop, window: Arc<Window>, mesh: Mesh) -> Self
+    pub fn new(event_loop: &ActiveEventLoop, window: Arc<Window>) -> Self
     {
         // Init Vulkan library
         let library = VulkanLibrary::new().expect("Vulkan library creation failed");
@@ -305,18 +310,6 @@ impl GfxApi
             depth_stencil_format,
         );
 
-        // Allocate hard-coded mesh and set position
-        let (vertex_buffer, index_buffer) = Self::allocate_vertex_data_buffers(
-            memory_allocator.clone(),
-            command_buffer_allocator.clone(),
-            queue.clone(),
-            &mesh,
-        );
-
-        let object_transform_data = ObjectTransformData {
-            matrix: Mat4::IDENTITY.to_cols_array_2d(),
-        };
-
         // Allocate view and perspective projection data
         let view_projection_data = ViewProjectionData::default();
         let view_perspective_data_buffer = Self::allocate_view_perspective_data_buffer(
@@ -352,9 +345,7 @@ impl GfxApi
             memory_allocator,
             command_buffer_allocator,
             descriptor_set_allocator,
-            vertex_buffer,
-            index_buffer,
-            object_transform_data,
+            render_meshes_data: HashMap::new(),
             view_projection_data,
             view_perspective_data_buffer,
             view_perspective_data_descriptor_set,
@@ -370,6 +361,37 @@ impl GfxApi
     {
         self.should_recreate_swapchain = true;
         self.window_size = new_size.into();
+    }
+
+    /// Initialize a new mesh for rendering (upload data to GPU)
+    pub fn init_mesh(&mut self, mesh: &Mesh, transform_matrix: [[f32; 4]; 4])
+    {
+        // Check first if mesh isn't already loaded
+        // TODO: Add support for multiple instances of same mesh
+        if self.render_meshes_data.contains_key(&mesh.filepath)
+        {
+            return;
+        }
+
+        // Allocate buffers
+        let (vertex_buffer, index_buffer) = Self::allocate_vertex_data_buffers(
+            self.memory_allocator.clone(),
+            self.command_buffer_allocator.clone(),
+            self.queue.clone(),
+            mesh,
+        );
+
+        let transform_data = ObjectTransformData {
+            matrix: transform_matrix,
+        };
+        let render_mesh_data = RenderMeshData {
+            vertex_buffer,
+            index_buffer,
+            transform_data,
+        };
+
+        self.render_meshes_data
+            .insert(mesh.filepath.clone(), render_mesh_data);
     }
 
     /// Record and execute rendering commands once the next frame image is ready
@@ -415,28 +437,36 @@ impl GfxApi
             .unwrap()
             .bind_pipeline_graphics(self.graphics_pipeline.clone())
             .unwrap()
-            .bind_vertex_buffers(0, self.vertex_buffer.clone())
-            .unwrap()
-            .bind_index_buffer(self.index_buffer.clone())
-            .unwrap()
             .bind_descriptor_sets(
                 PipelineBindPoint::Graphics,
                 self.graphics_pipeline.layout().clone(),
                 0,
                 self.view_perspective_data_descriptor_set.clone(),
             )
-            .unwrap()
-            .push_constants(
-                self.graphics_pipeline.layout().clone(),
-                0,
-                self.object_transform_data.clone(),
-            )
             .ok();
 
-        unsafe { command_buffer_builder.draw_indexed(self.index_buffer.len() as u32, 1, 0, 0, 0) }
+        // Draw each mesh
+        for (_, mesh_data) in self.render_meshes_data.iter()
+        {
+            command_buffer_builder
+                .bind_vertex_buffers(0, mesh_data.vertex_buffer.clone())
+                .unwrap()
+                .bind_index_buffer(mesh_data.index_buffer.clone())
+                .unwrap()
+                .push_constants(
+                    self.graphics_pipeline.layout().clone(),
+                    0,
+                    mesh_data.transform_data.clone(),
+                )
+                .ok();
+
+            unsafe {
+                command_buffer_builder.draw_indexed(mesh_data.index_buffer.len() as u32, 1, 0, 0, 0)
+            }
             .unwrap()
             .end_render_pass(Default::default())
             .ok();
+        }
 
         // Submit command buffer, present when previous frame ends and image becomes available,
         // then signal fence once presentation is finished
@@ -506,9 +536,32 @@ impl GfxApi
         };
     }
 
+    /// Update specific mesh's transform
+    ///
+    /// Call will be ignored if mesh has not been initialized via `init_mesh`
+    pub fn update_mesh_transform(&mut self, filepath: &String, new_matrix: [[f32; 4]; 4])
+    {
+        if self.render_meshes_data.contains_key(filepath)
+        {
+            self.render_meshes_data
+                .get_mut(filepath)
+                .unwrap()
+                .transform_data
+                .matrix = new_matrix;
+        }
+        else
+        {
+            #[cfg(debug_assertions)]
+            println!(
+                "GfxApi :: update_mesh_transform :: Mesh: {filepath} ::\
+                Mesh has not been initialized. Ignoring call."
+            )
+        }
+    }
+
     /// Update view-projection buffer data from latest camera update
     /// # Panics
-    /// Will panic if this is called while the GPU is using the uniform buffer
+    /// Will panic if this is called while the GPU is using the uniform buffer\
     /// Need to wait until the previous frame is finished processing before calling this function
     fn update_view_projection_buffer(&mut self)
     {

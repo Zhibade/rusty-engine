@@ -1,11 +1,19 @@
-///! Rendereable 3D mesh component
-use glam::{Vec2, Vec3, Vec4};
+//! Rendereable 3D mesh component
 
-// Represents a 3D mesh for rendering
-// Contains the necessary data for rendering a mesh such as vertices, normals, etc
-#[derive(Default)]
+use super::component::Component;
+use derive_macros::Component;
+use glam::{Vec2, Vec3, Vec4};
+use std::any::Any;
+
+/// Represents a 3D mesh for rendering
+///
+/// Contains the necessary data for rendering a mesh such as vertices, normals, etc
+#[derive(Component, Default)]
 pub struct Mesh
 {
+    pub filepath: String,
+    pub has_been_initialized: bool, // Indicates if mesh data has been uploaded to the GPU or not
+
     pub vertices: Vec<Vec3>,
     pub indices: Vec<u32>,
     pub normals: Vec<Vec3>,

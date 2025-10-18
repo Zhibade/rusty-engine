@@ -1,10 +1,16 @@
-///! Camera component implementation
+//! Camera component implementation
+
+use super::component::Component;
+use super::transform::Transform;
+use derive_macros::Component;
 use glam::Mat4;
+use std::any::Any;
 
 /// Represents a camera in the world with transform and FOV values
+#[derive(Component)]
 pub struct Camera
 {
-    pub transform: Mat4,
+    pub is_active_camera: bool,
     pub fov: f32,
 }
 
@@ -14,16 +20,17 @@ impl Camera
     /// Get view & perspective projection matrices from the given camera
     pub fn get_view_projection_matrices(
         camera: &Camera,
+        transform: &Transform,
         window_size: [f32; 2],
         near_far_distance: [f32; 2],
     ) -> ([[f32; 4]; 4], [[f32; 4]; 4])
     {
-        let (_, _, translation) = camera.transform.to_scale_rotation_translation();
+        let (_, _, translation) = transform.matrix.to_scale_rotation_translation();
 
         let view_matrix = Mat4::look_at_lh(
             translation,
-            translation + camera.transform.z_axis.truncate(),
-            camera.transform.y_axis.truncate(),
+            translation + transform.matrix.z_axis.truncate(),
+            transform.matrix.y_axis.truncate(),
         );
 
         let projection_matrix = Mat4::perspective_lh(
@@ -47,7 +54,7 @@ impl Default for Camera
     fn default() -> Self
     {
         Camera {
-            transform: Mat4::IDENTITY,
+            is_active_camera: true,
             fov: 60.0,
         }
     }

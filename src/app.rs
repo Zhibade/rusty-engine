@@ -1,9 +1,15 @@
 //! Window application implementation
 
 use super::components::camera::Camera;
+use super::components::transform::Transform;
 use super::gfx_api::GfxApi;
 use super::loaders::mesh_loader;
-use glam::{Mat4, Vec3};
+use super::systems::camera_rendering::CameraRenderingSystem;
+use super::systems::mesh_rendering::MeshRenderingSystem;
+use super::world::World;
+use glam::Vec3;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -14,13 +20,45 @@ use winit::window::{Window, WindowId};
 #[derive(Default)]
 pub struct App
 {
-    camera: Camera,
-    gfx_api: Option<GfxApi>,
+    gfx_api: Option<Rc<RefCell<GfxApi>>>,
     window: Option<Arc<Window>>,
+    world: Option<World>,
 }
 
 impl App
 {
+    /// Initialize world + default camera and mesh
+    fn init_world(&mut self)
+    {
+        let mut world = World::default();
+
+        // Add camera entity
+        let camera_id = world.add_entity();
+        let camera_transform = Transform::from_position(Vec3::from_array([0.0, 0.5, -1.5]));
+
+        world.add_component(camera_id, Camera::default());
+        world.add_component(camera_id, camera_transform);
+
+        // Add mesh entity
+        let mesh = mesh_loader::load_mesh("assets/table.gltf".replace("/", "\\"));
+
+        let mesh_id = world.add_entity();
+        world.add_component(mesh_id, mesh);
+        world.add_component(mesh_id, Transform::default());
+
+        // Register camera and mesh systems
+        let mesh_rendering_system = MeshRenderingSystem::new(self.gfx_api.clone().unwrap());
+        let camera_rendering_system = CameraRenderingSystem::new(
+            self.gfx_api.clone().unwrap(),
+            self.window.as_ref().unwrap().inner_size().into(),
+        );
+
+        world.register_system(mesh_rendering_system);
+        world.register_system(camera_rendering_system);
+
+        self.world = Some(world);
+    }
+
     /// Run window application
     pub fn run(&mut self)
     {
@@ -35,18 +73,18 @@ impl ApplicationHandler for App
 {
     fn resumed(&mut self, event_loop: &ActiveEventLoop)
     {
-        // Get mesh data first. No need to initialize everything if mesh data is invalid
-        let mesh = mesh_loader::load_mesh("assets/table.gltf".replace("/", "\\"));
-
         // Initialize window and graphics API on window startup
         self.window = Some(Arc::new(
             event_loop.create_window(Window::default_attributes()).unwrap(),
         ));
-        self.gfx_api = Some(GfxApi::new(event_loop, self.window.clone().unwrap(), mesh));
-        self.camera = Camera {
-            transform: Mat4::from_translation(Vec3::from_array([0.0, 0.5, -1.5])),
-            ..Default::default()
-        };
+
+        // Initialize the world
+        self.gfx_api = Some(Rc::new(RefCell::new(GfxApi::new(
+            event_loop,
+            self.window.clone().unwrap(),
+        ))));
+
+        self.init_world();
     }
 
     fn window_event(
@@ -65,26 +103,27 @@ impl ApplicationHandler for App
 
             WindowEvent::RedrawRequested =>
             {
-                // Send camera updated transform to graphics API
-                let (view_matrix, projection_matrix) = Camera::get_view_projection_matrices(
-                    &self.camera,
-                    self.window.as_ref().unwrap().inner_size().into(),
-                    [0.01, 100.0],
-                );
-
-                self.gfx_api
-                    .as_mut()
-                    .unwrap()
-                    .update_camera(view_matrix, projection_matrix);
+                // Update world
+                if let Some(ref mut world) = self.world
+                {
+                    world.update();
+                }
 
                 // Render frame and update window
-                self.gfx_api.as_mut().unwrap().render();
+                if let Some(ref mut gfx_api) = self.gfx_api
+                {
+                    gfx_api.borrow_mut().render();
+                }
+
                 self.window.as_ref().unwrap().request_redraw();
             }
 
             WindowEvent::Resized(size) =>
             {
-                self.gfx_api.as_mut().unwrap().on_window_resized(size);
+                if let Some(ref mut gfx_api) = self.gfx_api
+                {
+                    gfx_api.borrow_mut().on_window_resized(size);
+                }
             }
 
             _ => (),

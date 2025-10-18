@@ -1,4 +1,5 @@
-///! Mesh loading utilities
+//! Mesh loading utilities
+
 use super::super::components::mesh::Mesh;
 use glam::{Vec2, Vec3, Vec4};
 use gltf;
@@ -44,7 +45,11 @@ pub fn load_mesh(filepath: impl AsRef<Path>) -> Mesh
         .unwrap();
     let mesh_data_reader = mesh_data.reader(|buffer| Some(&buffers[buffer.index()]));
 
-    let mut mesh = Mesh::default();
+    let mut mesh = Mesh {
+        filepath: String::from(path_str),
+        has_been_initialized: false,
+        ..Mesh::default()
+    };
 
     // Positions
     if let Some(positions) = mesh_data_reader.read_positions()

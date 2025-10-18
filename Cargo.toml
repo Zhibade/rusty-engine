@@ -6,5 +6,6 @@ edition = "2024"
 [dependencies]
 glam = "0.30.7"
 gltf = "1.4.1"
+derive-macros = { path = "derive-macros" }
 vulkano = "0.35.2"
 winit = "0.30.12"

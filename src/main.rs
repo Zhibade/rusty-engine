@@ -4,6 +4,8 @@ mod app;
 mod components;
 mod gfx_api;
 mod loaders;
+mod systems;
+mod world;
 
 fn main()
 {
