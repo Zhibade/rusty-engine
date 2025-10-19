@@ -441,10 +441,10 @@ impl GfxApi
             unsafe {
                 command_buffer_builder.draw_indexed(mesh_data.index_buffer.len() as u32, 1, 0, 0, 0)
             }
-            .unwrap()
-            .end_render_pass(Default::default())
             .ok();
         }
+
+        command_buffer_builder.end_render_pass(Default::default()).ok();
 
         // Submit command buffer, present when previous frame ends and image becomes available,
         // then signal fence once presentation is finished
