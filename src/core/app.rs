@@ -7,6 +7,7 @@ use crate::gfx_api::GfxApi;
 use crate::loaders::mesh_loader;
 use crate::systems::camera_rendering::CameraRenderingSystem;
 use crate::systems::mesh_rendering::MeshRenderingSystem;
+use crate::systems::mesh_rotator::MeshRotatorSystem;
 use glam::Vec3;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -48,12 +49,14 @@ impl App
 
         // Register camera and mesh systems
         let mesh_rendering_system = MeshRenderingSystem::new(self.gfx_api.clone().unwrap());
+        let mesh_rotator_system = MeshRotatorSystem::default();
         let camera_rendering_system = CameraRenderingSystem::new(
             self.gfx_api.clone().unwrap(),
             self.window.as_ref().unwrap().inner_size().into(),
         );
 
         world.register_system(mesh_rendering_system);
+        world.register_system(mesh_rotator_system);
         world.register_system(camera_rendering_system);
 
         self.world = Some(world);
