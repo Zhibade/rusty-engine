@@ -1,6 +1,6 @@
 //! Graphics API that will be used to render onto the application's window
 
-use super::components::mesh::Mesh;
+use crate::components::mesh::Mesh;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Read;

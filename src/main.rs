@@ -2,7 +2,7 @@
 
 mod components;
 mod core;
-mod gfx_api;
+mod graphics;
 mod loaders;
 mod systems;
 

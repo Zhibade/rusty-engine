@@ -3,7 +3,7 @@
 use crate::components::mesh::Mesh;
 use crate::components::transform::Transform;
 use crate::core::world::World;
-use crate::gfx_api::GfxApi;
+use crate::graphics::gfx_api::GfxApi;
 use crate::systems::system::System;
 use std::cell::RefCell;
 use std::ops::Deref;
