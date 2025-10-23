@@ -233,8 +233,8 @@ impl GfxApi
                 .expect("Failed to create swapchain");
 
         // Load shaders
-        let vert_shader_path = "src/shaders/vert.spv".replace("/", "\\");
-        let frag_shader_path = "src/shaders/frag.spv".replace("/", "\\");
+        let vert_shader_path = "src/graphics/shaders/vert.spv".replace("/", "\\");
+        let frag_shader_path = "src/graphics/shaders/frag.spv".replace("/", "\\");
 
         let (vert_shader_entry_point, frag_shader_entry_point) =
             Self::load_shaders(device.clone(), vert_shader_path, frag_shader_path);
