@@ -39,6 +39,29 @@ pub struct World
 
 impl World
 {
+    // --- Associated functions ---
+
+    /// Add an entity ID to a component cache\
+    /// If entity ID is already in component cache it is a no-op
+    fn add_entity_to_component_cache(
+        entity_id: usize,
+        component_type: &ComponentType,
+        component_cache: &mut HashMap<ComponentType, Vec<usize>>,
+    )
+    {
+        if !component_cache.contains_key(component_type)
+        {
+            component_cache.insert(component_type.clone(), Vec::new());
+        }
+
+        if !component_cache.get(component_type).unwrap().contains(&entity_id)
+        {
+            component_cache.get_mut(component_type).unwrap().push(entity_id);
+        }
+    }
+
+    // --- Methods ---
+
     /// Add a new entity without components to the world
     ///
     /// Entity ID is returned
@@ -184,25 +207,6 @@ impl World
         }
     }
 
-    /// Updates the component combination caches for this entity
-    fn update_component_cache(&mut self, entity_id: usize)
-    {
-        let mut component_types = Vec::new();
-
-        for component_type in self.entities[entity_id].keys()
-        {
-            component_types.push(component_type.clone());
-            component_types.sort(); // Need to sort to avoid different permutations
-
-            if !self.entity_component_cache.contains_key(&component_types)
-            {
-                self.entity_component_cache.insert(component_types.clone(), Vec::new());
-            }
-
-            self.entity_component_cache.get_mut(&component_types).unwrap().push(entity_id);
-        }
-    }
-
     /// Update the world for this frame
     ///
     /// All registered systems will run their `update` method
@@ -215,6 +219,91 @@ impl World
         });
 
         self.last_frame_time = Instant::now();
+    }
+
+    /// Updates the component combination caches for this entity
+    fn update_component_cache(&mut self, entity_id: usize)
+    {
+        let mut component_types: Vec<ComponentType> = Vec::new();
+
+        // Add single component types first
+        for component_type in self.entities[entity_id].keys()
+        {
+            let single_component_type: ComponentType = Vec::from([component_type.clone()]);
+
+            Self::add_entity_to_component_cache(
+                entity_id,
+                &single_component_type,
+                &mut self.entity_component_cache,
+            );
+
+            component_types.push(single_component_type);
+        }
+
+        // Add all component combinations
+        //
+        // First we start with single component as a base (e.g. "A", "B", "C"),
+        // and go through all single component combinations (e.g. "AB", "AC", "BC"),
+        // then we update the base to be the last combinations (e.g. "AB", "AC", "BC"),
+        // and repeat so we get the next order of combinations (e.g. "ABC")
+        let mut base_types = component_types.clone();
+
+        let mut current_combination_base_index = 0;
+        let mut current_combination_base =
+            base_types.get(current_combination_base_index).unwrap().clone();
+
+        let mut new_combinations = Vec::new();
+
+        loop
+        {
+            // Break loop if last combination equals the number of components
+            if current_combination_base.len() == self.entities[entity_id].len()
+            {
+                break;
+            }
+
+            // Check all component types against base combination
+            // and create the combinations with no repeated elements
+            for component_type in self.entities[entity_id].keys()
+            {
+                if !current_combination_base.contains(component_type)
+                {
+                    let mut combination: ComponentType = current_combination_base.clone();
+                    combination.push(component_type.clone());
+                    combination.sort(); // Need to sort to avoid different permutations
+
+                    if !new_combinations.contains(&combination)
+                    {
+                        Self::add_entity_to_component_cache(
+                            entity_id,
+                            &combination,
+                            &mut self.entity_component_cache,
+                        );
+
+                        new_combinations.push(combination);
+                    }
+                }
+            }
+
+            if current_combination_base_index < base_types.len() - 1
+            {
+                // Move to next component combination
+                current_combination_base_index += 1;
+                current_combination_base =
+                    base_types.get(current_combination_base_index).unwrap().clone()
+            }
+            else
+            {
+                // Add new combinations and use them as the new base for next iterations
+                base_types = new_combinations.clone();
+                component_types.extend(new_combinations.clone());
+                new_combinations.clear();
+
+                current_combination_base_index = 0;
+                current_combination_base =
+                    base_types.get(current_combination_base_index).unwrap().clone()
+            }
+        }
     }
 }
 
