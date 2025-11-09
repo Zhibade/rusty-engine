@@ -1,10 +1,12 @@
 //! Graphics API that will be used to render onto the application's window
 
+use crate::components::material::{Texture, TextureUsage};
 use crate::components::mesh::Mesh;
+use crate::loaders::image_loader::ImageData;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Read;
-use std::mem::size_of;
+use std::mem::{self, size_of};
 use std::path::Path;
 use std::sync::Arc;
 use vulkano::buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer};
@@ -13,7 +15,7 @@ use vulkano::command_buffer::allocator::{
 };
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, CommandBufferExecFuture, CommandBufferUsage, CopyBufferInfo,
-    PrimaryCommandBufferAbstract, RenderPassBeginInfo,
+    CopyBufferToImageInfo, PrimaryCommandBufferAbstract, RenderPassBeginInfo,
 };
 use vulkano::descriptor_set::allocator::{
     StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo,
@@ -27,8 +29,9 @@ use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
 };
 use vulkano::format::{Format, FormatFeatures};
+use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::image::view::ImageView;
-use vulkano::image::{Image, ImageCreateInfo, ImageLayout, ImageTiling, ImageUsage};
+use vulkano::image::{Image, ImageCreateInfo, ImageLayout, ImageTiling, ImageType, ImageUsage};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions};
 use vulkano::library::VulkanLibrary;
 use vulkano::memory::allocator::{
@@ -60,12 +63,28 @@ use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
+// Constants
+const VIEW_PROJ_DESCRIPTOR_SET_LAYOUT_INDEX: usize = 0;
+const TEXTURES_DESCRIPTOR_SET_LAYOUT_INDEX: usize = 1;
+
+const VERTEX_SHADER_PATH: &str = "src/graphics/shaders/vert.spv";
+const FRAGMENT_SHADER_PATH: &str = "src/graphics/shaders/frag.spv";
+const DEFAULT_BLACK_TEXTURE_PATH: &str = "default-black";
+const TEXTURE_COUNT: u32 = 1; // Hard-coding texture count for now to match shader
+
 /// Render mesh data after uploading to the GPU
 struct RenderMeshData
 {
     vertex_buffer: Subbuffer<[VertexData]>,
     index_buffer: Subbuffer<[u32]>,
     transform_data: ObjectTransformData,
+}
+
+/// Texture data after uploading to the GPU
+struct TextureData
+{
+    image_view: Arc<ImageView>,
+    sampler: Arc<Sampler>,
 }
 
 /// Object's transform data (passed as a push constant)
@@ -131,6 +150,9 @@ pub struct GfxApi
 
     // Rendering data that will be used in the shaders
     render_meshes_data: HashMap<String, RenderMeshData>,
+    texture_assignments: HashMap<TextureUsage, String>, // Currently used textures when drawing
+    texture_data: HashMap<String, TextureData>,
+    texture_descriptor_set: Arc<DescriptorSet>,
     view_projection_data: ViewProjectionData, // Current camera (view-projection) data
     view_perspective_data_buffer: Subbuffer<ViewProjectionData>,
     view_perspective_data_descriptor_set: Arc<DescriptorSet>,
@@ -233,11 +255,8 @@ impl GfxApi
                 .expect("Failed to create swapchain");
 
         // Load shaders
-        let vert_shader_path = "src/graphics/shaders/vert.spv".replace("/", "\\");
-        let frag_shader_path = "src/graphics/shaders/frag.spv".replace("/", "\\");
-
         let (vert_shader_entry_point, frag_shader_entry_point) =
-            Self::load_shaders(device.clone(), vert_shader_path, frag_shader_path);
+            Self::load_shaders(device.clone(), VERTEX_SHADER_PATH, FRAGMENT_SHADER_PATH);
 
         // Find best depth buffer format
         let depth_stencil_format =
@@ -280,6 +299,7 @@ impl GfxApi
             &render_pass,
             vert_shader_entry_point,
             frag_shader_entry_point,
+            TEXTURE_COUNT,
         );
 
         // Create memory allocators
@@ -310,13 +330,61 @@ impl GfxApi
             view_projection_data.clone(),
         );
 
+        let view_perspective_descriptor_set_layout = graphics_pipeline
+            .layout()
+            .set_layouts()
+            .get(VIEW_PROJ_DESCRIPTOR_SET_LAYOUT_INDEX)
+            .unwrap()
+            .clone();
+
         let view_perspective_data_descriptor_set = DescriptorSet::new(
             descriptor_set_allocator.clone(),
-            graphics_pipeline.layout().set_layouts().get(0).unwrap().clone(),
+            view_perspective_descriptor_set_layout,
             [WriteDescriptorSet::buffer(0, view_perspective_data_buffer.clone())],
             [],
         )
         .unwrap();
+
+        // Allocate placeholder texture data
+        let default_image_data = ImageData::default_black();
+        let default_texture = Texture {
+            filepath: String::from(DEFAULT_BLACK_TEXTURE_PATH),
+            is_rgb: true,
+            usage: TextureUsage::Albedo,
+        };
+
+        let default_texture_data_map = Self::allocate_texture_samplers(
+            memory_allocator.clone(),
+            command_buffer_allocator.clone(),
+            device.clone(),
+            queue.clone(),
+            Vec::from([(default_image_data, &default_texture)]),
+        );
+
+        let texture_descriptor_set_layout = graphics_pipeline
+            .layout()
+            .set_layouts()
+            .get(TEXTURES_DESCRIPTOR_SET_LAYOUT_INDEX)
+            .unwrap()
+            .clone();
+
+        let default_texture_data =
+            default_texture_data_map.get(DEFAULT_BLACK_TEXTURE_PATH).unwrap();
+
+        let texture_descriptor_set = DescriptorSet::new(
+            descriptor_set_allocator.clone(),
+            texture_descriptor_set_layout,
+            [WriteDescriptorSet::image_view_sampler(
+                0,
+                default_texture_data.image_view.clone(),
+                default_texture_data.sampler.clone(),
+            )],
+            [],
+        )
+        .unwrap();
+
+        let mut texture_assignments = HashMap::new();
+        texture_assignments.insert(TextureUsage::Albedo, String::from(DEFAULT_BLACK_TEXTURE_PATH));
 
         GfxApi {
             device,
@@ -331,6 +399,9 @@ impl GfxApi
             command_buffer_allocator,
             descriptor_set_allocator,
             render_meshes_data: HashMap::new(),
+            texture_assignments,
+            texture_data: default_texture_data_map,
+            texture_descriptor_set,
             view_projection_data,
             view_perspective_data_buffer,
             view_perspective_data_descriptor_set,
@@ -370,6 +441,89 @@ impl GfxApi
         let render_mesh_data = RenderMeshData { vertex_buffer, index_buffer, transform_data };
 
         self.render_meshes_data.insert(mesh.filepath.clone(), render_mesh_data);
+    }
+
+    /// Initialize new textures for rendering (upload data to GPU)
+    pub fn init_textures(&mut self, mut image_data: Vec<(ImageData, &Texture)>)
+    {
+        let mut new_texture_indices = Vec::new();
+
+        for (i, (_, texture)) in image_data.iter_mut().enumerate()
+        {
+            // Skip texture allocation if already loaded
+            if self.texture_data.contains_key(&texture.filepath)
+            {
+                #[cfg(debug_assertions)]
+                println!(
+                    "GfxApi :: init_texture :: Texture {} :: Texture is already initialized.\
+                        Skipping initialization.",
+                    texture.filepath
+                );
+            }
+            else
+            {
+                new_texture_indices.push(i);
+            }
+
+            // Assign textures based on usage
+            // TODO: This needs to be handled per material, not have a single global assignment
+            self.texture_assignments.insert(texture.usage.clone(), texture.filepath.clone());
+        }
+
+        // Allocate all new texture samplers
+        let mut image_data_to_allocate = Vec::new();
+        for index in new_texture_indices
+        {
+            // Move image data to avoid copying unnecessarily
+            let moved_data = mem::take(&mut image_data[index].0);
+            image_data_to_allocate.push((moved_data, image_data[index].1));
+        }
+
+        if !image_data_to_allocate.is_empty()
+        {
+            let new_texture_data = Self::allocate_texture_samplers(
+                self.memory_allocator.clone(),
+                self.command_buffer_allocator.clone(),
+                self.device.clone(),
+                self.queue.clone(),
+                image_data_to_allocate,
+            );
+
+            self.texture_data.extend(new_texture_data);
+        }
+
+        // Update texture descriptor set
+        let mut texture_bindings = Vec::new();
+        for (texture_usage, filepath) in self.texture_assignments.iter()
+        {
+            let texture_data = self.texture_data.get(filepath).unwrap();
+
+            let write_descriptor_set = WriteDescriptorSet::image_view_sampler(
+                texture_usage.clone() as u32,
+                texture_data.image_view.clone(),
+                texture_data.sampler.clone(),
+            );
+
+            texture_bindings.push(write_descriptor_set);
+        }
+
+        let descriptor_set_layout = self
+            .graphics_pipeline
+            .layout()
+            .set_layouts()
+            .get(TEXTURES_DESCRIPTOR_SET_LAYOUT_INDEX)
+            .unwrap()
+            .clone();
+
+        let texture_descriptor_set = DescriptorSet::new(
+            self.descriptor_set_allocator.clone(),
+            descriptor_set_layout,
+            texture_bindings,
+            [],
+        )
+        .unwrap();
+
+        self.texture_descriptor_set = texture_descriptor_set;
     }
 
     /// Record and execute rendering commands once the next frame image is ready
@@ -419,7 +573,10 @@ impl GfxApi
                 PipelineBindPoint::Graphics,
                 self.graphics_pipeline.layout().clone(),
                 0,
-                self.view_perspective_data_descriptor_set.clone(),
+                Vec::from([
+                    self.view_perspective_data_descriptor_set.clone(),
+                    self.texture_descriptor_set.clone(),
+                ]),
             )
             .ok();
 
@@ -536,9 +693,17 @@ impl GfxApi
         let mut buffer_write = self.view_perspective_data_buffer.write().unwrap();
         *buffer_write = self.view_projection_data.clone();
 
+        let descriptor_set_layout = self
+            .graphics_pipeline
+            .layout()
+            .set_layouts()
+            .get(VIEW_PROJ_DESCRIPTOR_SET_LAYOUT_INDEX)
+            .unwrap()
+            .clone();
+
         self.view_perspective_data_descriptor_set = DescriptorSet::new(
             self.descriptor_set_allocator.clone(),
-            self.graphics_pipeline.layout().set_layouts().get(0).unwrap().clone(),
+            descriptor_set_layout,
             [WriteDescriptorSet::buffer(0, self.view_perspective_data_buffer.clone())],
             [],
         )
@@ -654,6 +819,99 @@ impl GfxApi
         }
 
         Vec::new()
+    }
+
+    fn allocate_texture_samplers(
+        memory_allocator: Arc<dyn MemoryAllocator>,
+        command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+        device: Arc<Device>,
+        queue: Arc<Queue>,
+        image_data: Vec<(ImageData, &Texture)>,
+    ) -> HashMap<String, TextureData>
+    {
+        // Create temporary command buffer for copying textures to GPU
+        let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
+            command_buffer_allocator,
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .unwrap();
+
+        let mut new_texture_data = HashMap::new();
+
+        for (image_data, texture) in image_data
+        {
+            // Create a temporary staging buffer for sending image data to GPU
+            let staging_buffer_create_info =
+                BufferCreateInfo { usage: BufferUsage::TRANSFER_SRC, ..Default::default() };
+
+            let staging_buffer_alloc_create_info = AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            };
+
+            let staging_buffer = Buffer::from_iter(
+                memory_allocator.clone(),
+                staging_buffer_create_info,
+                staging_buffer_alloc_create_info,
+                image_data.data,
+            )
+            .unwrap();
+
+            // Create GPU image buffer
+            let image_format =
+                if texture.is_rgb { Format::R8G8B8A8_SRGB } else { Format::R8G8B8A8_SNORM };
+
+            let image_create_info = ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: image_format,
+                extent: [image_data.size[0], image_data.size[1], 1],
+                usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+                ..Default::default()
+            };
+
+            let image = Image::new(
+                memory_allocator.clone(),
+                image_create_info,
+                AllocationCreateInfo::default(),
+            )
+            .unwrap();
+
+            // Create image view, sampler, and then add to texture data collection
+            let image_view = ImageView::new_default(image.clone()).unwrap();
+
+            let sampler_create_info = SamplerCreateInfo {
+                mag_filter: Filter::Linear,
+                min_filter: Filter::Linear,
+                address_mode: [SamplerAddressMode::Repeat; 3],
+                ..Default::default()
+            };
+
+            let sampler = Sampler::new(device.clone(), sampler_create_info).unwrap();
+
+            let texture_data = TextureData { image_view, sampler };
+            new_texture_data.insert(texture.filepath.clone(), texture_data);
+
+            // Register GPU copy command
+            let copy_buffer_to_image_info =
+                CopyBufferToImageInfo::buffer_image(staging_buffer, image);
+
+            command_buffer_builder.copy_buffer_to_image(copy_buffer_to_image_info).ok();
+        }
+
+        // Execute command buffer and wait until it is done
+        command_buffer_builder
+            .build()
+            .unwrap()
+            .execute(queue.clone())
+            .expect("Failed to copy buffer to image")
+            .then_signal_fence_and_flush()
+            .unwrap()
+            .wait(None) // Block until image is copied
+            .ok();
+
+        new_texture_data
     }
 
     /// Allocate vertex and index buffers on the device using given [Mesh] data
@@ -806,6 +1064,7 @@ impl GfxApi
         render_pass: &Arc<RenderPass>,
         vert_shader_entry_point: EntryPoint,
         frag_shader_entry_point: EntryPoint,
+        texture_count: u32,
     ) -> Arc<GraphicsPipeline>
     {
         let vertex_input_state =
@@ -840,32 +1099,65 @@ impl GfxApi
         ];
 
         // Declare push constant range for objects' transform matrix,
-        // and descriptor set layout for view and perspective matrices,
-        // then pass to pipeline layout
+        // and descriptor set layout for view and perspective matrices
         let push_constant_range = PushConstantRange {
             stages: ShaderStages::VERTEX,
             offset: 0,
             size: size_of::<ObjectTransformData>() as u32,
         };
 
-        let descriptor_set_layout_binding = DescriptorSetLayoutBinding {
+        let view_proj_descriptor_set_layout_binding = DescriptorSetLayoutBinding {
             descriptor_type: DescriptorType::UniformBuffer,
             descriptor_count: 1,
             stages: ShaderStages::VERTEX,
             ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
         };
 
-        let descriptor_set_layout_create_info = DescriptorSetLayoutCreateInfo {
-            bindings: BTreeMap::from([(0, descriptor_set_layout_binding)]),
+        // Create descriptor set layouts for view-projection matrices
+        let view_proj_descriptor_set_layout_create_info = DescriptorSetLayoutCreateInfo {
+            bindings: BTreeMap::from([(0, view_proj_descriptor_set_layout_binding)]),
             ..DescriptorSetLayoutCreateInfo::default()
         };
 
-        let descriptor_set_layout =
-            DescriptorSetLayout::new(device.clone(), descriptor_set_layout_create_info).unwrap();
+        let view_proj_descriptor_set_layout =
+            DescriptorSetLayout::new(device.clone(), view_proj_descriptor_set_layout_create_info)
+                .unwrap();
+
+        // Create pipeline layout
+        let mut descriptor_set_layouts = Vec::from([view_proj_descriptor_set_layout]);
+
+        // If using textures, create textures' descriptor set layout and add it to pipeline layout
+        if texture_count > 0
+        {
+            let textures_descriptor_set_layout_binding = DescriptorSetLayoutBinding {
+                descriptor_type: DescriptorType::CombinedImageSampler,
+                descriptor_count: 1,
+                stages: ShaderStages::FRAGMENT,
+                ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::CombinedImageSampler)
+            };
+
+            // Create one binding per texture
+            let texture_bindings: Vec<_> = (0..texture_count)
+                .map(|i| (i, textures_descriptor_set_layout_binding.clone()))
+                .collect();
+
+            let textures_descriptor_set_layout_create_info = DescriptorSetLayoutCreateInfo {
+                bindings: BTreeMap::from_iter(texture_bindings),
+                ..DescriptorSetLayoutCreateInfo::default()
+            };
+
+            let textures_descriptor_set_layout = DescriptorSetLayout::new(
+                device.clone(),
+                textures_descriptor_set_layout_create_info,
+            )
+            .unwrap();
+
+            descriptor_set_layouts.push(textures_descriptor_set_layout);
+        };
 
         let pipeline_layout_create_info = PipelineLayoutCreateInfo {
             push_constant_ranges: Vec::from([push_constant_range]),
-            set_layouts: Vec::from([descriptor_set_layout]),
+            set_layouts: descriptor_set_layouts,
             ..PipelineLayoutCreateInfo::default()
         };
 

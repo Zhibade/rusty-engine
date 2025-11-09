@@ -1,11 +1,13 @@
 //! Window application implementation
 
 use crate::components::camera::Camera;
+use crate::components::material::{Material, Texture, TextureUsage};
 use crate::components::transform::Transform;
 use crate::core::world::World;
 use crate::graphics::gfx_api::GfxApi;
 use crate::loaders::mesh_loader;
 use crate::systems::camera_rendering::CameraRenderingSystem;
+use crate::systems::material_rendering::MaterialRenderingSystem;
 use crate::systems::mesh_rendering::MeshRenderingSystem;
 use crate::systems::mesh_rotator::MeshRotatorSystem;
 use glam::Vec3;
@@ -40,15 +42,26 @@ impl App
         world.add_component(camera_id, Camera::default());
         world.add_component(camera_id, camera_transform);
 
-        // Add mesh entity
-        let mesh = mesh_loader::load_mesh("assets/table.gltf".replace("/", "\\"));
+        // Add mesh entity with material
+        let mesh = mesh_loader::load_mesh("assets/models/test_sphere.gltf");
+
+        let color_tex = Texture {
+            filepath: String::from("assets/textures/uv_checker.png"),
+            is_rgb: true,
+            usage: TextureUsage::Albedo,
+        };
+
+        let material = Material { textures: vec![color_tex], ..Default::default() };
 
         let mesh_id = world.add_entity();
         world.add_component(mesh_id, mesh);
+        world.add_component(mesh_id, material);
         world.add_component(mesh_id, Transform::default());
 
         // Register camera and mesh systems
         let mesh_rendering_system = MeshRenderingSystem::new(self.gfx_api.clone().unwrap());
+        let material_rendering_system = MaterialRenderingSystem::new(self.gfx_api.clone().unwrap());
+
         let mesh_rotator_system = MeshRotatorSystem::default();
         let camera_rendering_system = CameraRenderingSystem::new(
             self.gfx_api.clone().unwrap(),
@@ -56,6 +69,7 @@ impl App
         );
 
         world.register_system(mesh_rendering_system);
+        world.register_system(material_rendering_system);
         world.register_system(mesh_rotator_system);
         world.register_system(camera_rendering_system);
 

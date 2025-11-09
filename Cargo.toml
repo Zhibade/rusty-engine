@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+derive-macros = { path = "derive-macros" }
 glam = "0.30.7"
 gltf = "1.4.1"
-derive-macros = { path = "derive-macros" }
+png = "0.18.0"
 vulkano = "0.35.2"
 winit = "0.30.12"
