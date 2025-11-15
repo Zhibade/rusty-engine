@@ -1144,7 +1144,7 @@ impl GfxApi
 
         let rasterization_state = RasterizationState {
             cull_mode: CullMode::Back,
-            front_face: FrontFace::Clockwise,
+            front_face: FrontFace::CounterClockwise,
             ..Default::default()
         };
 
