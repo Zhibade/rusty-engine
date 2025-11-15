@@ -17,13 +17,13 @@ impl ImageData
     /// Create a 2x2 white image data
     pub fn default_white() -> Self
     {
-        ImageData { data: Vec::from([255; 16]), size: [2, 2] }
+        ImageData { data: Vec::from([255; 4]), size: [1, 1] }
     }
 
     /// Create 2x2 black image data
     pub fn default_black() -> Self
     {
-        ImageData { data: Vec::from([0; 16]), size: [2, 2] }
+        ImageData { data: Vec::from([0; 4]), size: [1, 1] }
     }
 }
 

@@ -3,6 +3,7 @@
 use crate::components::material::{Texture, TextureUsage};
 use crate::components::mesh::Mesh;
 use crate::loaders::image_loader::ImageData;
+use std::cmp;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Read;
@@ -14,8 +15,9 @@ use vulkano::command_buffer::allocator::{
     StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo,
 };
 use vulkano::command_buffer::{
-    AutoCommandBufferBuilder, CommandBufferExecFuture, CommandBufferUsage, CopyBufferInfo,
-    CopyBufferToImageInfo, PrimaryCommandBufferAbstract, RenderPassBeginInfo,
+    AutoCommandBufferBuilder, BlitImageInfo, CommandBufferExecFuture, CommandBufferUsage,
+    CopyBufferInfo, CopyBufferToImageInfo, ImageBlit, PrimaryCommandBufferAbstract,
+    RenderPassBeginInfo,
 };
 use vulkano::descriptor_set::allocator::{
     StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo,
@@ -29,9 +31,13 @@ use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
 };
 use vulkano::format::{Format, FormatFeatures};
-use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
+use vulkano::image::sampler::{
+    Filter, LOD_CLAMP_NONE, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode,
+};
 use vulkano::image::view::ImageView;
-use vulkano::image::{Image, ImageCreateInfo, ImageLayout, ImageTiling, ImageType, ImageUsage};
+use vulkano::image::{
+    Image, ImageCreateInfo, ImageLayout, ImageSubresourceLayers, ImageTiling, ImageType, ImageUsage,
+};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions};
 use vulkano::library::VulkanLibrary;
 use vulkano::memory::allocator::{
@@ -863,11 +869,24 @@ impl GfxApi
             let image_format =
                 if texture.is_rgb { Format::R8G8B8A8_SRGB } else { Format::R8G8B8A8_SNORM };
 
+            let mipmap_num = {
+                let largest_dimension = cmp::max(image_data.size[0], image_data.size[1]);
+                if largest_dimension < 2 { 1 } else { largest_dimension.ilog2() }
+            };
+
+            let mut image_usage = ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED;
+            if mipmap_num > 1
+            {
+                // Only set as transfer source when generating mipmaps
+                image_usage = image_usage | ImageUsage::TRANSFER_SRC;
+            }
+
             let image_create_info = ImageCreateInfo {
                 image_type: ImageType::Dim2d,
                 format: image_format,
                 extent: [image_data.size[0], image_data.size[1], 1],
-                usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+                mip_levels: mipmap_num,
+                usage: image_usage,
                 ..Default::default()
             };
 
@@ -884,7 +903,9 @@ impl GfxApi
             let sampler_create_info = SamplerCreateInfo {
                 mag_filter: Filter::Linear,
                 min_filter: Filter::Linear,
+                mipmap_mode: SamplerMipmapMode::Linear,
                 address_mode: [SamplerAddressMode::Repeat; 3],
+                lod: 0.0..=LOD_CLAMP_NONE,
                 ..Default::default()
             };
 
@@ -895,9 +916,53 @@ impl GfxApi
 
             // Register GPU copy command
             let copy_buffer_to_image_info =
-                CopyBufferToImageInfo::buffer_image(staging_buffer, image);
+                CopyBufferToImageInfo::buffer_image(staging_buffer, image.clone());
 
             command_buffer_builder.copy_buffer_to_image(copy_buffer_to_image_info).ok();
+
+            // Generate mipmaps
+            let image_width = image.extent()[0];
+            let image_height = image.extent()[1];
+
+            // For each mipmap, downscale previous mipmap by half
+            let mut next_mipmap_width = image_width;
+            let mut next_mipmap_height = image_height;
+
+            if mipmap_num > 1
+            {
+                for i in 1..mipmap_num
+                {
+                    let src_subresource_layer =
+                        ImageSubresourceLayers { mip_level: i - 1, ..image.subresource_layers() };
+
+                    let dst_subresource_layer =
+                        ImageSubresourceLayers { mip_level: i, ..image.subresource_layers() };
+
+                    let previous_width = next_mipmap_width;
+                    let previous_height = next_mipmap_height;
+
+                    next_mipmap_width = cmp::max(1, next_mipmap_width / 2);
+                    next_mipmap_height = cmp::max(1, next_mipmap_height / 2);
+
+                    let blit_region = ImageBlit {
+                        src_subresource: src_subresource_layer,
+                        src_offsets: [[0; 3], [previous_width, previous_height, 1]],
+                        dst_subresource: dst_subresource_layer,
+                        dst_offsets: [[0; 3], [next_mipmap_width, next_mipmap_height, 1]],
+                        ..Default::default()
+                    };
+
+                    let blit_image_info = BlitImageInfo {
+                        regions: Vec::from([blit_region]).into(),
+                        filter: Filter::Linear,
+                        ..BlitImageInfo::images(image.clone(), image.clone())
+                    };
+
+                    command_buffer_builder
+                        .blit_image(blit_image_info)
+                        .expect(format!("Failed to generate mipmap {i}").as_str());
+                }
+            }
         }
 
         // Execute command buffer and wait until it is done
@@ -905,7 +970,7 @@ impl GfxApi
             .build()
             .unwrap()
             .execute(queue.clone())
-            .expect("Failed to copy buffer to image")
+            .expect("Failed to upload image to GPU")
             .then_signal_fence_and_flush()
             .unwrap()
             .wait(None) // Block until image is copied
