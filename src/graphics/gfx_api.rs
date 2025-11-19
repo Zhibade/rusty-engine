@@ -177,6 +177,8 @@ pub struct GfxApi
 
 impl GfxApi
 {
+    // --- Associated Functions ---
+
     /// Create and initialize a new graphics API instance
     /// API will be ready after being created, only need to call [render] method
     pub fn new(event_loop: &ActiveEventLoop, window: Arc<Window>) -> Self
@@ -416,6 +418,683 @@ impl GfxApi
             previous_frame_end: None,
         }
     }
+
+    /// Find the best physical device that supports required extensions
+    fn get_best_physical_device_and_queue(
+        instance: &Arc<Instance>,
+        event_loop: &ActiveEventLoop,
+        device_extensions: &DeviceExtensions,
+    ) -> (Arc<PhysicalDevice>, u32)
+    {
+        let (physical_device, queue_family_index) = instance
+            .enumerate_physical_devices()
+            .unwrap()
+            .filter_map(|device| {
+                // Check if it supports required extensions and queue family
+                if device.supported_extensions().contains(&device_extensions)
+                {
+                    device
+                        .queue_family_properties()
+                        .iter()
+                        .enumerate()
+                        .position(|(i, queue)| {
+                            queue.queue_flags.intersects(QueueFlags::GRAPHICS)
+                                && device.presentation_support(i as u32, event_loop).unwrap()
+                        })
+                        .map(|index| (device, index as u32))
+                }
+                else
+                {
+                    None
+                }
+            })
+            .min_by_key(|(device, _)| {
+                // Find the best candidate based on the priority below
+                match device.properties().device_type
+                {
+                    PhysicalDeviceType::DiscreteGpu => 0,
+                    PhysicalDeviceType::IntegratedGpu => 1,
+                    PhysicalDeviceType::VirtualGpu => 2,
+                    PhysicalDeviceType::Cpu => 3,
+                    PhysicalDeviceType::Other => 4,
+                    _ => 5,
+                }
+            })
+            .expect("No suitable physical device found");
+
+        (physical_device, queue_family_index)
+    }
+
+    /// Get validation layers to be used depending on build configuration
+    fn get_enabled_layers() -> Vec<String>
+    {
+        if cfg!(debug_assertions)
+        {
+            return Vec::from([String::from("VK_LAYER_KHRONOS_validation")]);
+        }
+
+        Vec::new()
+    }
+
+    /// Allocate a texture and its sampler using the given [ImageData] and [Texture] data
+    fn allocate_texture_samplers(
+        memory_allocator: Arc<dyn MemoryAllocator>,
+        command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+        device: Arc<Device>,
+        queue: Arc<Queue>,
+        image_data: Vec<(ImageData, &Texture)>,
+    ) -> HashMap<String, TextureData>
+    {
+        // Create temporary command buffer for copying textures to GPU
+        let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
+            command_buffer_allocator,
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+            .unwrap();
+
+        let mut new_texture_data = HashMap::new();
+
+        for (image_data, texture) in image_data
+        {
+            // Create a temporary staging buffer for sending image data to GPU
+            let staging_buffer_create_info =
+                BufferCreateInfo { usage: BufferUsage::TRANSFER_SRC, ..Default::default() };
+
+            let staging_buffer_alloc_create_info = AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            };
+
+            let staging_buffer = Buffer::from_iter(
+                memory_allocator.clone(),
+                staging_buffer_create_info,
+                staging_buffer_alloc_create_info,
+                image_data.data,
+            )
+                .unwrap();
+
+            // Create GPU image buffer
+            let image_format =
+                if texture.is_rgb { Format::R8G8B8A8_SRGB } else { Format::R8G8B8A8_SNORM };
+
+            let mipmap_num = {
+                let largest_dimension = cmp::max(image_data.size[0], image_data.size[1]);
+                if largest_dimension < 2 { 1 } else { largest_dimension.ilog2() }
+            };
+
+            let mut image_usage = ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED;
+            if mipmap_num > 1
+            {
+                // Only set as transfer source when generating mipmaps
+                image_usage = image_usage | ImageUsage::TRANSFER_SRC;
+            }
+
+            let image_create_info = ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: image_format,
+                extent: [image_data.size[0], image_data.size[1], 1],
+                mip_levels: mipmap_num,
+                usage: image_usage,
+                ..Default::default()
+            };
+
+            let image = Image::new(
+                memory_allocator.clone(),
+                image_create_info,
+                AllocationCreateInfo::default(),
+            )
+                .unwrap();
+
+            // Create image view, sampler, and then add to texture data collection
+            let image_view = ImageView::new_default(image.clone()).unwrap();
+
+            let sampler_create_info = SamplerCreateInfo {
+                mag_filter: Filter::Linear,
+                min_filter: Filter::Linear,
+                mipmap_mode: SamplerMipmapMode::Linear,
+                address_mode: [SamplerAddressMode::Repeat; 3],
+                lod: 0.0..=LOD_CLAMP_NONE,
+                ..Default::default()
+            };
+
+            let sampler = Sampler::new(device.clone(), sampler_create_info).unwrap();
+
+            let texture_data = TextureData { image_view, sampler };
+            new_texture_data.insert(texture.filepath.clone(), texture_data);
+
+            // Register GPU copy command
+            let copy_buffer_to_image_info =
+                CopyBufferToImageInfo::buffer_image(staging_buffer, image.clone());
+
+            command_buffer_builder.copy_buffer_to_image(copy_buffer_to_image_info).ok();
+
+            // Generate mipmaps
+            let image_width = image.extent()[0];
+            let image_height = image.extent()[1];
+
+            // For each mipmap, downscale previous mipmap by half
+            let mut next_mipmap_width = image_width;
+            let mut next_mipmap_height = image_height;
+
+            if mipmap_num > 1
+            {
+                for i in 1..mipmap_num
+                {
+                    let src_subresource_layer =
+                        ImageSubresourceLayers { mip_level: i - 1, ..image.subresource_layers() };
+
+                    let dst_subresource_layer =
+                        ImageSubresourceLayers { mip_level: i, ..image.subresource_layers() };
+
+                    let previous_width = next_mipmap_width;
+                    let previous_height = next_mipmap_height;
+
+                    next_mipmap_width = cmp::max(1, next_mipmap_width / 2);
+                    next_mipmap_height = cmp::max(1, next_mipmap_height / 2);
+
+                    let blit_region = ImageBlit {
+                        src_subresource: src_subresource_layer,
+                        src_offsets: [[0; 3], [previous_width, previous_height, 1]],
+                        dst_subresource: dst_subresource_layer,
+                        dst_offsets: [[0; 3], [next_mipmap_width, next_mipmap_height, 1]],
+                        ..Default::default()
+                    };
+
+                    let blit_image_info = BlitImageInfo {
+                        regions: Vec::from([blit_region]).into(),
+                        filter: Filter::Linear,
+                        ..BlitImageInfo::images(image.clone(), image.clone())
+                    };
+
+                    command_buffer_builder
+                        .blit_image(blit_image_info)
+                        .expect(format!("Failed to generate mipmap {i}").as_str());
+                }
+            }
+        }
+
+        // Execute command buffer and wait until it is done
+        command_buffer_builder
+            .build()
+            .unwrap()
+            .execute(queue.clone())
+            .expect("Failed to upload image to GPU")
+            .then_signal_fence_and_flush()
+            .unwrap()
+            .wait(None) // Block until image is copied
+            .ok();
+
+        new_texture_data
+    }
+
+    /// Allocate vertex and index buffers on the device using given [Mesh] data
+    fn allocate_vertex_data_buffers(
+        memory_allocator: Arc<dyn MemoryAllocator>,
+        command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+        queue: Arc<Queue>,
+        mesh: &Mesh,
+    ) -> (Subbuffer<[VertexData]>, Subbuffer<[u32]>)
+    {
+        // Get vertex data from mesh
+        let mut vertices: Vec<VertexData> = Vec::with_capacity(mesh.vertices.len());
+        for (i, vertex) in mesh.vertices.iter().enumerate()
+        {
+            let data = VertexData {
+                position: vertex.to_array(),
+                normals: mesh.normals[i].to_array(),
+                tangents: mesh.tangents[i].to_array(),
+                uv0: mesh.uv_sets[0][i].to_array(),
+                uv1: mesh.uv_sets[1][i].to_array(),
+                color: mesh.colors[i].to_array(),
+            };
+
+            vertices.push(data);
+        }
+
+        let num_of_vertices = vertices.len();
+
+        // Since data won't change frequently, using device local buffers is more performant
+        // However, need a staging buffer first to store the data and then send it to the GPU
+        let staging_buffer_create_info =
+            BufferCreateInfo { usage: BufferUsage::TRANSFER_SRC, ..Default::default() };
+
+        let staging_allocation_create_info = AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        };
+
+        let device_local_allocation_create_info = AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        };
+
+        // Create vertex buffers (staging and device local)
+        let vertex_staging_buffer = Buffer::from_iter(
+            memory_allocator.clone(),
+            staging_buffer_create_info.clone(),
+            staging_allocation_create_info.clone(),
+            vertices,
+        )
+            .unwrap();
+
+        let vertex_buffer_create_info = BufferCreateInfo {
+            usage: BufferUsage::VERTEX_BUFFER | BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        };
+
+        let vertex_buffer = Buffer::new_slice::<VertexData>(
+            memory_allocator.clone(),
+            vertex_buffer_create_info,
+            device_local_allocation_create_info.clone(),
+            num_of_vertices as DeviceSize,
+        )
+            .unwrap();
+
+        // Create index buffer
+        let index_staging_buffer = Buffer::from_iter(
+            memory_allocator.clone(),
+            staging_buffer_create_info,
+            staging_allocation_create_info,
+            mesh.indices.clone(),
+        )
+            .unwrap();
+
+        let index_buffer_create_info = BufferCreateInfo {
+            usage: BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        };
+
+        let index_buffer = Buffer::new_slice::<u32>(
+            memory_allocator,
+            index_buffer_create_info,
+            device_local_allocation_create_info,
+            mesh.indices.len() as DeviceSize,
+        )
+            .unwrap();
+
+        // Copy buffers to GPU using a temporary command buffer
+        let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
+            command_buffer_allocator,
+            queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+            .unwrap();
+
+        let vertex_copy_buffer_info =
+            CopyBufferInfo::buffers(vertex_staging_buffer, vertex_buffer.clone());
+
+        let index_copy_buffer_info =
+            CopyBufferInfo::buffers(index_staging_buffer, index_buffer.clone());
+
+        command_buffer_builder
+            .copy_buffer(vertex_copy_buffer_info)
+            .unwrap()
+            .copy_buffer(index_copy_buffer_info)
+            .unwrap();
+
+        command_buffer_builder
+            .build()
+            .unwrap()
+            .execute(queue)
+            .expect("Failed to execute command buffer")
+            .then_signal_fence_and_flush()
+            .unwrap()
+            .wait(None)
+            .unwrap(); // Block until copy is executed
+
+        (vertex_buffer, index_buffer)
+    }
+
+    /// Allocate view + perspective projection matrices data using given [MemoryAllocator]
+    fn allocate_view_perspective_data_buffer(
+        memory_allocator: Arc<dyn MemoryAllocator>,
+        view_projection_data: ViewProjectionData,
+    ) -> Subbuffer<ViewProjectionData>
+    {
+        let buffer_create_info =
+            BufferCreateInfo { usage: BufferUsage::UNIFORM_BUFFER, ..Default::default() };
+
+        let allocation_create_info = AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        };
+
+        Buffer::from_data(
+            memory_allocator,
+            buffer_create_info,
+            allocation_create_info,
+            view_projection_data,
+        )
+            .unwrap()
+    }
+
+    /// Create and initialize the graphics pipeline that will be used for rendering
+    fn create_graphics_pipeline(
+        device: &Arc<Device>,
+        swapchain: &Arc<Swapchain>,
+        render_pass: &Arc<RenderPass>,
+        vert_shader_entry_point: EntryPoint,
+        frag_shader_entry_point: EntryPoint,
+        texture_count: u32,
+    ) -> Arc<GraphicsPipeline>
+    {
+        let vertex_input_state =
+            VertexData::per_vertex().definition(&vert_shader_entry_point).unwrap();
+
+        let scissor = Scissor { offset: [0; 2], extent: swapchain.image_extent() };
+
+        let viewport_state = ViewportState {
+            scissors: [scissor].into_iter().collect(),
+            ..Default::default() // Not setting viewport since it is resized dynamically
+        };
+
+        let rasterization_state = RasterizationState {
+            cull_mode: CullMode::Back,
+            front_face: FrontFace::CounterClockwise,
+            ..Default::default()
+        };
+
+        let color_blend_state = ColorBlendState {
+            attachments: Vec::from([ColorBlendAttachmentState::default()]),
+            ..Default::default()
+        };
+
+        let depth_stencil_state =
+            DepthStencilState { depth: Some(DepthState::simple()), ..Default::default() };
+
+        let subpass = Subpass::from(render_pass.clone(), 0).expect("Failed to create subpass");
+
+        let pipeline_stages = [
+            PipelineShaderStageCreateInfo::new(vert_shader_entry_point),
+            PipelineShaderStageCreateInfo::new(frag_shader_entry_point),
+        ];
+
+        // Declare push constant range for objects' transform matrix,
+        // and descriptor set layout for view and perspective matrices
+        let push_constant_range = PushConstantRange {
+            stages: ShaderStages::VERTEX,
+            offset: 0,
+            size: size_of::<ObjectTransformData>() as u32,
+        };
+
+        let view_proj_descriptor_set_layout_binding = DescriptorSetLayoutBinding {
+            descriptor_type: DescriptorType::UniformBuffer,
+            descriptor_count: 1,
+            stages: ShaderStages::VERTEX,
+            ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
+        };
+
+        // Create descriptor set layouts for view-projection matrices
+        let view_proj_descriptor_set_layout_create_info = DescriptorSetLayoutCreateInfo {
+            bindings: BTreeMap::from([(0, view_proj_descriptor_set_layout_binding)]),
+            ..DescriptorSetLayoutCreateInfo::default()
+        };
+
+        let view_proj_descriptor_set_layout =
+            DescriptorSetLayout::new(device.clone(), view_proj_descriptor_set_layout_create_info)
+                .unwrap();
+
+        // Create pipeline layout
+        let mut descriptor_set_layouts = Vec::from([view_proj_descriptor_set_layout]);
+
+        // If using textures, create textures' descriptor set layout and add it to pipeline layout
+        if texture_count > 0
+        {
+            let textures_descriptor_set_layout_binding = DescriptorSetLayoutBinding {
+                descriptor_type: DescriptorType::CombinedImageSampler,
+                descriptor_count: 1,
+                stages: ShaderStages::FRAGMENT,
+                ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::CombinedImageSampler)
+            };
+
+            // Create one binding per texture
+            let texture_bindings: Vec<_> = (0..texture_count)
+                .map(|i| (i, textures_descriptor_set_layout_binding.clone()))
+                .collect();
+
+            let textures_descriptor_set_layout_create_info = DescriptorSetLayoutCreateInfo {
+                bindings: BTreeMap::from_iter(texture_bindings),
+                ..DescriptorSetLayoutCreateInfo::default()
+            };
+
+            let textures_descriptor_set_layout = DescriptorSetLayout::new(
+                device.clone(),
+                textures_descriptor_set_layout_create_info,
+            )
+                .unwrap();
+
+            descriptor_set_layouts.push(textures_descriptor_set_layout);
+        };
+
+        let pipeline_layout_create_info = PipelineLayoutCreateInfo {
+            push_constant_ranges: Vec::from([push_constant_range]),
+            set_layouts: descriptor_set_layouts,
+            ..PipelineLayoutCreateInfo::default()
+        };
+
+        let pipeline_layout =
+            PipelineLayout::new(device.clone(), pipeline_layout_create_info).unwrap();
+
+        let graphics_pipeline_create_info = GraphicsPipelineCreateInfo {
+            stages: pipeline_stages.into_iter().collect(),
+            vertex_input_state: Some(vertex_input_state),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            viewport_state: Some(viewport_state),
+            rasterization_state: Some(rasterization_state),
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(color_blend_state),
+            depth_stencil_state: Some(depth_stencil_state),
+            subpass: Some(subpass.into()),
+            // Need to resize viewport if window is resized, so need to set as dynamic
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            ..GraphicsPipelineCreateInfo::layout(pipeline_layout)
+        };
+
+        GraphicsPipeline::new(device.clone(), None, graphics_pipeline_create_info)
+            .expect("Failed to create graphics pipeline")
+    }
+
+    /// Create a framebuffer per image and making them compatible with the given render pass
+    fn create_framebuffers(
+        memory_allocator: Arc<dyn MemoryAllocator>,
+        images: &Vec<Arc<Image>>,
+        render_pass: &Arc<RenderPass>,
+        depth_stencil_format: Format,
+    ) -> Vec<Arc<Framebuffer>>
+    {
+        let mut framebuffers = Vec::new();
+
+        // Create a framebuffer per swapchain image
+        for image in images
+        {
+            // Create image view from each frame buffer image
+            let image_view = ImageView::new_default(image.clone()).unwrap();
+
+            // Create depth-stencil image per frame buffer
+            let depth_stencil_image_create_info = ImageCreateInfo {
+                format: depth_stencil_format,
+                extent: image.extent(),
+                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
+                initial_layout: ImageLayout::Undefined,
+                ..Default::default()
+            };
+
+            let depth_stencil_allocation_info = AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            };
+
+            let depth_stencil_image = Image::new(
+                memory_allocator.clone(),
+                depth_stencil_image_create_info,
+                depth_stencil_allocation_info,
+            )
+                .expect("Failed to create depth stencil image");
+
+            let depth_stencil_image_view =
+                ImageView::new_default(depth_stencil_image.clone()).unwrap();
+
+            // Create framebuffer
+            let framebuffer_create_info = FramebufferCreateInfo {
+                attachments: Vec::from([image_view, depth_stencil_image_view]),
+                ..Default::default()
+            };
+
+            let framebuffer = Framebuffer::new(render_pass.clone(), framebuffer_create_info)
+                .expect("Failed to create framebuffer");
+
+            framebuffers.push(framebuffer);
+        }
+
+        framebuffers
+    }
+
+    /// Load vertex and fragment shader at the given paths
+    ///
+    /// # Panics
+    /// It will panic if any of the files doesn't exist, or if they are not correct shader files
+    fn load_shaders(
+        device: Arc<Device>,
+        vert_shader_path: impl AsRef<Path>,
+        frag_shader_path: impl AsRef<Path>,
+    ) -> (EntryPoint, EntryPoint)
+    {
+        let paths = Vec::from([vert_shader_path.as_ref(), frag_shader_path.as_ref()]);
+        let mut entry_points = Vec::new();
+
+        for path in paths
+        {
+            let filepath = Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+
+            let mut bytes = Vec::new();
+            let mut file = File::open(&filepath)
+                .expect(&format!("Failed to open shader file {}", filepath.to_str().unwrap()));
+
+            file.read_to_end(&mut bytes)
+                .expect(&format!("Failed to read shader file {}", filepath.to_str().unwrap()));
+
+            let shader_words = vulkano::shader::spirv::bytes_to_words(&bytes)
+                .expect("Failed to read shader words from file {filepath}");
+
+            let shader_module_create_info = ShaderModuleCreateInfo::new(&shader_words);
+            let shader_module =
+                unsafe { ShaderModule::new(device.clone(), shader_module_create_info).unwrap() };
+
+            let entry_point = shader_module.entry_point("main").unwrap();
+            entry_points.push(entry_point);
+        }
+
+        let frag_entry_point = entry_points.pop().unwrap();
+        let vert_entry_point = entry_points.pop().unwrap();
+
+        (vert_entry_point, frag_entry_point)
+    }
+
+    /// Find the best supported format by the device for use as a depth buffer
+    /// # Panics
+    /// Will panic if physical device does not support any depth buffer format
+    fn get_best_supported_depth_buffer_format(physical_device: &Arc<PhysicalDevice>) -> Format
+    {
+        // Tiling methods to check, in order from best to worst
+        let tiling_methods = [ImageTiling::Optimal, ImageTiling::Linear];
+
+        // Depth formats to check, in order from best to worst
+        let depth_formats = [
+            Format::D32_SFLOAT_S8_UINT,
+            Format::D24_UNORM_S8_UINT,
+            Format::D16_UNORM_S8_UINT,
+            Format::D32_SFLOAT,
+            Format::D16_UNORM,
+        ];
+
+        let mut best_depth_format = None;
+
+        for tiling_method in tiling_methods
+        {
+            for format in depth_formats
+            {
+                let format_properties = physical_device.format_properties(format).unwrap();
+
+                let tiling_features = match tiling_method
+                {
+                    ImageTiling::Optimal => format_properties.optimal_tiling_features,
+                    ImageTiling::Linear => format_properties.linear_tiling_features,
+                    _ => format_properties.optimal_tiling_features,
+                };
+
+                if tiling_features.contains(FormatFeatures::DEPTH_STENCIL_ATTACHMENT)
+                {
+                    best_depth_format = Some(format);
+                    break;
+                }
+            }
+
+            if best_depth_format.is_some()
+            {
+                break;
+            }
+        }
+
+        // If no format is found, panic
+        if best_depth_format.is_none()
+        {
+            panic!("No suitable depth buffer format found");
+        };
+
+        best_depth_format.unwrap()
+    }
+
+    /// Utility function for converting device type to a string slice for logging
+    #[cfg(debug_assertions)]
+    fn get_device_type_name(device_type: &PhysicalDeviceType) -> &str
+    {
+        match device_type
+        {
+            PhysicalDeviceType::DiscreteGpu => "Discrete GPU",
+            PhysicalDeviceType::IntegratedGpu => "Integrated GPU",
+            PhysicalDeviceType::VirtualGpu => "Virtual GPU",
+            PhysicalDeviceType::Cpu => "CPU",
+            PhysicalDeviceType::Other => "Other",
+            _ => "Other",
+        }
+    }
+
+    /// Debug log the depth stencil format
+    #[cfg(debug_assertions)]
+    fn log_depth_stencil_format(format: &Format)
+    {
+        let format_str = match format
+        {
+            Format::D32_SFLOAT_S8_UINT => "D32_SFLOAT_S8_UINT",
+            Format::D24_UNORM_S8_UINT => "D24_UNORM_S8_UINT",
+            Format::D16_UNORM_S8_UINT => "D16_UNORM_S8_UINT",
+            Format::D32_SFLOAT => "D32_SFLOAT",
+            Format::D16_UNORM => "D16_UNORM",
+            _ => "Unknown",
+        };
+
+        println!("Depth stencil format: {format_str}");
+    }
+
+    /// Debug log the required Vulkan instance extensions
+    #[cfg(debug_assertions)]
+    fn log_required_extensions(required_extensions: &InstanceExtensions)
+    {
+        println!("Required Extensions:");
+
+        for extension in required_extensions.into_iter()
+        {
+            println!("{}", extension.0);
+        }
+
+        println!("-----------------------");
+    }
+
+    // --- Methods ---
 
     /// Notify graphics API that window has been resized so that it updates its rendering
     /// state to match the new window size
@@ -716,634 +1395,6 @@ impl GfxApi
         .expect("Failed to update view projection data buffer");
     }
 
-    /// Find the best physical device that supports required extensions
-    fn get_best_physical_device_and_queue(
-        instance: &Arc<Instance>,
-        event_loop: &ActiveEventLoop,
-        device_extensions: &DeviceExtensions,
-    ) -> (Arc<PhysicalDevice>, u32)
-    {
-        let (physical_device, queue_family_index) = instance
-            .enumerate_physical_devices()
-            .unwrap()
-            .filter_map(|device| {
-                // Check if it supports required extensions and queue family
-                if device.supported_extensions().contains(&device_extensions)
-                {
-                    device
-                        .queue_family_properties()
-                        .iter()
-                        .enumerate()
-                        .position(|(i, queue)| {
-                            queue.queue_flags.intersects(QueueFlags::GRAPHICS)
-                                && device.presentation_support(i as u32, event_loop).unwrap()
-                        })
-                        .map(|index| (device, index as u32))
-                }
-                else
-                {
-                    None
-                }
-            })
-            .min_by_key(|(device, _)| {
-                // Find the best candidate based on the priority below
-                match device.properties().device_type
-                {
-                    PhysicalDeviceType::DiscreteGpu => 0,
-                    PhysicalDeviceType::IntegratedGpu => 1,
-                    PhysicalDeviceType::VirtualGpu => 2,
-                    PhysicalDeviceType::Cpu => 3,
-                    PhysicalDeviceType::Other => 4,
-                    _ => 5,
-                }
-            })
-            .expect("No suitable physical device found");
-
-        (physical_device, queue_family_index)
-    }
-
-    /// Find the best supported format by the device for use as a depth buffer
-    /// # Panics
-    /// Will panic if physical device does not support any depth buffer format
-    fn get_best_supported_depth_buffer_format(physical_device: &Arc<PhysicalDevice>) -> Format
-    {
-        // Tiling methods to check, in order from best to worst
-        let tiling_methods = [ImageTiling::Optimal, ImageTiling::Linear];
-
-        // Depth formats to check, in order from best to worst
-        let depth_formats = [
-            Format::D32_SFLOAT_S8_UINT,
-            Format::D24_UNORM_S8_UINT,
-            Format::D16_UNORM_S8_UINT,
-            Format::D32_SFLOAT,
-            Format::D16_UNORM,
-        ];
-
-        let mut best_depth_format = None;
-
-        for tiling_method in tiling_methods
-        {
-            for format in depth_formats
-            {
-                let format_properties = physical_device.format_properties(format).unwrap();
-
-                let tiling_features = match tiling_method
-                {
-                    ImageTiling::Optimal => format_properties.optimal_tiling_features,
-                    ImageTiling::Linear => format_properties.linear_tiling_features,
-                    _ => format_properties.optimal_tiling_features,
-                };
-
-                if tiling_features.contains(FormatFeatures::DEPTH_STENCIL_ATTACHMENT)
-                {
-                    best_depth_format = Some(format);
-                    break;
-                }
-            }
-
-            if best_depth_format.is_some()
-            {
-                break;
-            }
-        }
-
-        // If no format is found, panic
-        if best_depth_format.is_none()
-        {
-            panic!("No suitable depth buffer format found");
-        };
-
-        best_depth_format.unwrap()
-    }
-
-    /// Get validation layers to be used depending on build configuration
-    fn get_enabled_layers() -> Vec<String>
-    {
-        if cfg!(debug_assertions)
-        {
-            return Vec::from([String::from("VK_LAYER_KHRONOS_validation")]);
-        }
-
-        Vec::new()
-    }
-
-    fn allocate_texture_samplers(
-        memory_allocator: Arc<dyn MemoryAllocator>,
-        command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
-        device: Arc<Device>,
-        queue: Arc<Queue>,
-        image_data: Vec<(ImageData, &Texture)>,
-    ) -> HashMap<String, TextureData>
-    {
-        // Create temporary command buffer for copying textures to GPU
-        let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
-            command_buffer_allocator,
-            queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap();
-
-        let mut new_texture_data = HashMap::new();
-
-        for (image_data, texture) in image_data
-        {
-            // Create a temporary staging buffer for sending image data to GPU
-            let staging_buffer_create_info =
-                BufferCreateInfo { usage: BufferUsage::TRANSFER_SRC, ..Default::default() };
-
-            let staging_buffer_alloc_create_info = AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            };
-
-            let staging_buffer = Buffer::from_iter(
-                memory_allocator.clone(),
-                staging_buffer_create_info,
-                staging_buffer_alloc_create_info,
-                image_data.data,
-            )
-            .unwrap();
-
-            // Create GPU image buffer
-            let image_format =
-                if texture.is_rgb { Format::R8G8B8A8_SRGB } else { Format::R8G8B8A8_SNORM };
-
-            let mipmap_num = {
-                let largest_dimension = cmp::max(image_data.size[0], image_data.size[1]);
-                if largest_dimension < 2 { 1 } else { largest_dimension.ilog2() }
-            };
-
-            let mut image_usage = ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED;
-            if mipmap_num > 1
-            {
-                // Only set as transfer source when generating mipmaps
-                image_usage = image_usage | ImageUsage::TRANSFER_SRC;
-            }
-
-            let image_create_info = ImageCreateInfo {
-                image_type: ImageType::Dim2d,
-                format: image_format,
-                extent: [image_data.size[0], image_data.size[1], 1],
-                mip_levels: mipmap_num,
-                usage: image_usage,
-                ..Default::default()
-            };
-
-            let image = Image::new(
-                memory_allocator.clone(),
-                image_create_info,
-                AllocationCreateInfo::default(),
-            )
-            .unwrap();
-
-            // Create image view, sampler, and then add to texture data collection
-            let image_view = ImageView::new_default(image.clone()).unwrap();
-
-            let sampler_create_info = SamplerCreateInfo {
-                mag_filter: Filter::Linear,
-                min_filter: Filter::Linear,
-                mipmap_mode: SamplerMipmapMode::Linear,
-                address_mode: [SamplerAddressMode::Repeat; 3],
-                lod: 0.0..=LOD_CLAMP_NONE,
-                ..Default::default()
-            };
-
-            let sampler = Sampler::new(device.clone(), sampler_create_info).unwrap();
-
-            let texture_data = TextureData { image_view, sampler };
-            new_texture_data.insert(texture.filepath.clone(), texture_data);
-
-            // Register GPU copy command
-            let copy_buffer_to_image_info =
-                CopyBufferToImageInfo::buffer_image(staging_buffer, image.clone());
-
-            command_buffer_builder.copy_buffer_to_image(copy_buffer_to_image_info).ok();
-
-            // Generate mipmaps
-            let image_width = image.extent()[0];
-            let image_height = image.extent()[1];
-
-            // For each mipmap, downscale previous mipmap by half
-            let mut next_mipmap_width = image_width;
-            let mut next_mipmap_height = image_height;
-
-            if mipmap_num > 1
-            {
-                for i in 1..mipmap_num
-                {
-                    let src_subresource_layer =
-                        ImageSubresourceLayers { mip_level: i - 1, ..image.subresource_layers() };
-
-                    let dst_subresource_layer =
-                        ImageSubresourceLayers { mip_level: i, ..image.subresource_layers() };
-
-                    let previous_width = next_mipmap_width;
-                    let previous_height = next_mipmap_height;
-
-                    next_mipmap_width = cmp::max(1, next_mipmap_width / 2);
-                    next_mipmap_height = cmp::max(1, next_mipmap_height / 2);
-
-                    let blit_region = ImageBlit {
-                        src_subresource: src_subresource_layer,
-                        src_offsets: [[0; 3], [previous_width, previous_height, 1]],
-                        dst_subresource: dst_subresource_layer,
-                        dst_offsets: [[0; 3], [next_mipmap_width, next_mipmap_height, 1]],
-                        ..Default::default()
-                    };
-
-                    let blit_image_info = BlitImageInfo {
-                        regions: Vec::from([blit_region]).into(),
-                        filter: Filter::Linear,
-                        ..BlitImageInfo::images(image.clone(), image.clone())
-                    };
-
-                    command_buffer_builder
-                        .blit_image(blit_image_info)
-                        .expect(format!("Failed to generate mipmap {i}").as_str());
-                }
-            }
-        }
-
-        // Execute command buffer and wait until it is done
-        command_buffer_builder
-            .build()
-            .unwrap()
-            .execute(queue.clone())
-            .expect("Failed to upload image to GPU")
-            .then_signal_fence_and_flush()
-            .unwrap()
-            .wait(None) // Block until image is copied
-            .ok();
-
-        new_texture_data
-    }
-
-    /// Allocate vertex and index buffers on the device using given [Mesh] data
-    fn allocate_vertex_data_buffers(
-        memory_allocator: Arc<dyn MemoryAllocator>,
-        command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
-        queue: Arc<Queue>,
-        mesh: &Mesh,
-    ) -> (Subbuffer<[VertexData]>, Subbuffer<[u32]>)
-    {
-        // Get vertex data from mesh
-        let mut vertices: Vec<VertexData> = Vec::with_capacity(mesh.vertices.len());
-        for (i, vertex) in mesh.vertices.iter().enumerate()
-        {
-            let data = VertexData {
-                position: vertex.to_array(),
-                normals: mesh.normals[i].to_array(),
-                tangents: mesh.tangents[i].to_array(),
-                uv0: mesh.uv_sets[0][i].to_array(),
-                uv1: mesh.uv_sets[1][i].to_array(),
-                color: mesh.colors[i].to_array(),
-            };
-
-            vertices.push(data);
-        }
-
-        let num_of_vertices = vertices.len();
-
-        // Since data won't change frequently, using device local buffers is more performant
-        // However, need a staging buffer first to store the data and then send it to the GPU
-        let staging_buffer_create_info =
-            BufferCreateInfo { usage: BufferUsage::TRANSFER_SRC, ..Default::default() };
-
-        let staging_allocation_create_info = AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        };
-
-        let device_local_allocation_create_info = AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-            ..Default::default()
-        };
-
-        // Create vertex buffers (staging and device local)
-        let vertex_staging_buffer = Buffer::from_iter(
-            memory_allocator.clone(),
-            staging_buffer_create_info.clone(),
-            staging_allocation_create_info.clone(),
-            vertices,
-        )
-        .unwrap();
-
-        let vertex_buffer_create_info = BufferCreateInfo {
-            usage: BufferUsage::VERTEX_BUFFER | BufferUsage::TRANSFER_DST,
-            ..Default::default()
-        };
-
-        let vertex_buffer = Buffer::new_slice::<VertexData>(
-            memory_allocator.clone(),
-            vertex_buffer_create_info,
-            device_local_allocation_create_info.clone(),
-            num_of_vertices as DeviceSize,
-        )
-        .unwrap();
-
-        // Create index buffer
-        let index_staging_buffer = Buffer::from_iter(
-            memory_allocator.clone(),
-            staging_buffer_create_info,
-            staging_allocation_create_info,
-            mesh.indices.clone(),
-        )
-        .unwrap();
-
-        let index_buffer_create_info = BufferCreateInfo {
-            usage: BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST,
-            ..Default::default()
-        };
-
-        let index_buffer = Buffer::new_slice::<u32>(
-            memory_allocator,
-            index_buffer_create_info,
-            device_local_allocation_create_info,
-            mesh.indices.len() as DeviceSize,
-        )
-        .unwrap();
-
-        // Copy buffers to GPU using a temporary command buffer
-        let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
-            command_buffer_allocator,
-            queue.queue_family_index(),
-            CommandBufferUsage::OneTimeSubmit,
-        )
-        .unwrap();
-
-        let vertex_copy_buffer_info =
-            CopyBufferInfo::buffers(vertex_staging_buffer, vertex_buffer.clone());
-
-        let index_copy_buffer_info =
-            CopyBufferInfo::buffers(index_staging_buffer, index_buffer.clone());
-
-        command_buffer_builder
-            .copy_buffer(vertex_copy_buffer_info)
-            .unwrap()
-            .copy_buffer(index_copy_buffer_info)
-            .unwrap();
-
-        command_buffer_builder
-            .build()
-            .unwrap()
-            .execute(queue)
-            .expect("Failed to execute command buffer")
-            .then_signal_fence_and_flush()
-            .unwrap()
-            .wait(None)
-            .unwrap(); // Block until copy is executed
-
-        (vertex_buffer, index_buffer)
-    }
-
-    /// Allocate view + perspective projection matrices data using given [MemoryAllocator]
-    fn allocate_view_perspective_data_buffer(
-        memory_allocator: Arc<dyn MemoryAllocator>,
-        view_projection_data: ViewProjectionData,
-    ) -> Subbuffer<ViewProjectionData>
-    {
-        let buffer_create_info =
-            BufferCreateInfo { usage: BufferUsage::UNIFORM_BUFFER, ..Default::default() };
-
-        let allocation_create_info = AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-            ..Default::default()
-        };
-
-        Buffer::from_data(
-            memory_allocator,
-            buffer_create_info,
-            allocation_create_info,
-            view_projection_data,
-        )
-        .unwrap()
-    }
-
-    /// Create and initialize the graphics pipeline that will be used for rendering
-    fn create_graphics_pipeline(
-        device: &Arc<Device>,
-        swapchain: &Arc<Swapchain>,
-        render_pass: &Arc<RenderPass>,
-        vert_shader_entry_point: EntryPoint,
-        frag_shader_entry_point: EntryPoint,
-        texture_count: u32,
-    ) -> Arc<GraphicsPipeline>
-    {
-        let vertex_input_state =
-            VertexData::per_vertex().definition(&vert_shader_entry_point).unwrap();
-
-        let scissor = Scissor { offset: [0; 2], extent: swapchain.image_extent() };
-
-        let viewport_state = ViewportState {
-            scissors: [scissor].into_iter().collect(),
-            ..Default::default() // Not setting viewport since it is resized dynamically
-        };
-
-        let rasterization_state = RasterizationState {
-            cull_mode: CullMode::Back,
-            front_face: FrontFace::CounterClockwise,
-            ..Default::default()
-        };
-
-        let color_blend_state = ColorBlendState {
-            attachments: Vec::from([ColorBlendAttachmentState::default()]),
-            ..Default::default()
-        };
-
-        let depth_stencil_state =
-            DepthStencilState { depth: Some(DepthState::simple()), ..Default::default() };
-
-        let subpass = Subpass::from(render_pass.clone(), 0).expect("Failed to create subpass");
-
-        let pipeline_stages = [
-            PipelineShaderStageCreateInfo::new(vert_shader_entry_point),
-            PipelineShaderStageCreateInfo::new(frag_shader_entry_point),
-        ];
-
-        // Declare push constant range for objects' transform matrix,
-        // and descriptor set layout for view and perspective matrices
-        let push_constant_range = PushConstantRange {
-            stages: ShaderStages::VERTEX,
-            offset: 0,
-            size: size_of::<ObjectTransformData>() as u32,
-        };
-
-        let view_proj_descriptor_set_layout_binding = DescriptorSetLayoutBinding {
-            descriptor_type: DescriptorType::UniformBuffer,
-            descriptor_count: 1,
-            stages: ShaderStages::VERTEX,
-            ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
-        };
-
-        // Create descriptor set layouts for view-projection matrices
-        let view_proj_descriptor_set_layout_create_info = DescriptorSetLayoutCreateInfo {
-            bindings: BTreeMap::from([(0, view_proj_descriptor_set_layout_binding)]),
-            ..DescriptorSetLayoutCreateInfo::default()
-        };
-
-        let view_proj_descriptor_set_layout =
-            DescriptorSetLayout::new(device.clone(), view_proj_descriptor_set_layout_create_info)
-                .unwrap();
-
-        // Create pipeline layout
-        let mut descriptor_set_layouts = Vec::from([view_proj_descriptor_set_layout]);
-
-        // If using textures, create textures' descriptor set layout and add it to pipeline layout
-        if texture_count > 0
-        {
-            let textures_descriptor_set_layout_binding = DescriptorSetLayoutBinding {
-                descriptor_type: DescriptorType::CombinedImageSampler,
-                descriptor_count: 1,
-                stages: ShaderStages::FRAGMENT,
-                ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::CombinedImageSampler)
-            };
-
-            // Create one binding per texture
-            let texture_bindings: Vec<_> = (0..texture_count)
-                .map(|i| (i, textures_descriptor_set_layout_binding.clone()))
-                .collect();
-
-            let textures_descriptor_set_layout_create_info = DescriptorSetLayoutCreateInfo {
-                bindings: BTreeMap::from_iter(texture_bindings),
-                ..DescriptorSetLayoutCreateInfo::default()
-            };
-
-            let textures_descriptor_set_layout = DescriptorSetLayout::new(
-                device.clone(),
-                textures_descriptor_set_layout_create_info,
-            )
-            .unwrap();
-
-            descriptor_set_layouts.push(textures_descriptor_set_layout);
-        };
-
-        let pipeline_layout_create_info = PipelineLayoutCreateInfo {
-            push_constant_ranges: Vec::from([push_constant_range]),
-            set_layouts: descriptor_set_layouts,
-            ..PipelineLayoutCreateInfo::default()
-        };
-
-        let pipeline_layout =
-            PipelineLayout::new(device.clone(), pipeline_layout_create_info).unwrap();
-
-        let graphics_pipeline_create_info = GraphicsPipelineCreateInfo {
-            stages: pipeline_stages.into_iter().collect(),
-            vertex_input_state: Some(vertex_input_state),
-            input_assembly_state: Some(InputAssemblyState::default()),
-            viewport_state: Some(viewport_state),
-            rasterization_state: Some(rasterization_state),
-            multisample_state: Some(MultisampleState::default()),
-            color_blend_state: Some(color_blend_state),
-            depth_stencil_state: Some(depth_stencil_state),
-            subpass: Some(subpass.into()),
-            // Need to resize viewport if window is resized, so need to set as dynamic
-            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            ..GraphicsPipelineCreateInfo::layout(pipeline_layout)
-        };
-
-        GraphicsPipeline::new(device.clone(), None, graphics_pipeline_create_info)
-            .expect("Failed to create graphics pipeline")
-    }
-
-    /// Create a framebuffer per image and making them compatible with the given render pass
-    fn create_framebuffers(
-        memory_allocator: Arc<dyn MemoryAllocator>,
-        images: &Vec<Arc<Image>>,
-        render_pass: &Arc<RenderPass>,
-        depth_stencil_format: Format,
-    ) -> Vec<Arc<Framebuffer>>
-    {
-        let mut framebuffers = Vec::new();
-
-        // Create a framebuffer per swapchain image
-        for image in images
-        {
-            // Create image view from each frame buffer image
-            let image_view = ImageView::new_default(image.clone()).unwrap();
-
-            // Create depth-stencil image per frame buffer
-            let depth_stencil_image_create_info = ImageCreateInfo {
-                format: depth_stencil_format,
-                extent: image.extent(),
-                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT | ImageUsage::TRANSIENT_ATTACHMENT,
-                initial_layout: ImageLayout::Undefined,
-                ..Default::default()
-            };
-
-            let depth_stencil_allocation_info = AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-                ..Default::default()
-            };
-
-            let depth_stencil_image = Image::new(
-                memory_allocator.clone(),
-                depth_stencil_image_create_info,
-                depth_stencil_allocation_info,
-            )
-            .expect("Failed to create depth stencil image");
-
-            let depth_stencil_image_view =
-                ImageView::new_default(depth_stencil_image.clone()).unwrap();
-
-            // Create framebuffer
-            let framebuffer_create_info = FramebufferCreateInfo {
-                attachments: Vec::from([image_view, depth_stencil_image_view]),
-                ..Default::default()
-            };
-
-            let framebuffer = Framebuffer::new(render_pass.clone(), framebuffer_create_info)
-                .expect("Failed to create framebuffer");
-
-            framebuffers.push(framebuffer);
-        }
-
-        framebuffers
-    }
-
-    /// Load vertex and fragment shader at the given paths
-    ///
-    /// # Panics
-    /// It will panic if any of the files doesn't exist, or if they are not correct shader files
-    fn load_shaders(
-        device: Arc<Device>,
-        vert_shader_path: impl AsRef<Path>,
-        frag_shader_path: impl AsRef<Path>,
-    ) -> (EntryPoint, EntryPoint)
-    {
-        let paths = Vec::from([vert_shader_path.as_ref(), frag_shader_path.as_ref()]);
-        let mut entry_points = Vec::new();
-
-        for path in paths
-        {
-            let filepath = Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
-
-            let mut bytes = Vec::new();
-            let mut file = File::open(&filepath)
-                .expect(&format!("Failed to open shader file {}", filepath.to_str().unwrap()));
-
-            file.read_to_end(&mut bytes)
-                .expect(&format!("Failed to read shader file {}", filepath.to_str().unwrap()));
-
-            let shader_words = vulkano::shader::spirv::bytes_to_words(&bytes)
-                .expect("Failed to read shader words from file {filepath}");
-
-            let shader_module_create_info = ShaderModuleCreateInfo::new(&shader_words);
-            let shader_module =
-                unsafe { ShaderModule::new(device.clone(), shader_module_create_info).unwrap() };
-
-            let entry_point = shader_module.entry_point("main").unwrap();
-            entry_points.push(entry_point);
-        }
-
-        let frag_entry_point = entry_points.pop().unwrap();
-        let vert_entry_point = entry_points.pop().unwrap();
-
-        (vert_entry_point, frag_entry_point)
-    }
-
     /// Recreate swapchain to match new surface's properties
     fn recreate_swapchain(&mut self)
     {
@@ -1369,51 +1420,5 @@ impl GfxApi
 
         // Mark as no longer needing update
         self.should_recreate_swapchain = false;
-    }
-
-    /// Utility function for converting device type to a string slice for logging
-    #[cfg(debug_assertions)]
-    fn get_device_type_name(device_type: &PhysicalDeviceType) -> &str
-    {
-        match device_type
-        {
-            PhysicalDeviceType::DiscreteGpu => "Discrete GPU",
-            PhysicalDeviceType::IntegratedGpu => "Integrated GPU",
-            PhysicalDeviceType::VirtualGpu => "Virtual GPU",
-            PhysicalDeviceType::Cpu => "CPU",
-            PhysicalDeviceType::Other => "Other",
-            _ => "Other",
-        }
-    }
-
-    /// Debug log the depth stencil format
-    #[cfg(debug_assertions)]
-    fn log_depth_stencil_format(format: &Format)
-    {
-        let format_str = match format
-        {
-            Format::D32_SFLOAT_S8_UINT => "D32_SFLOAT_S8_UINT",
-            Format::D24_UNORM_S8_UINT => "D24_UNORM_S8_UINT",
-            Format::D16_UNORM_S8_UINT => "D16_UNORM_S8_UINT",
-            Format::D32_SFLOAT => "D32_SFLOAT",
-            Format::D16_UNORM => "D16_UNORM",
-            _ => "Unknown",
-        };
-
-        println!("Depth stencil format: {format_str}");
-    }
-
-    /// Debug log the required Vulkan instance extensions
-    #[cfg(debug_assertions)]
-    fn log_required_extensions(required_extensions: &InstanceExtensions)
-    {
-        println!("Required Extensions:");
-
-        for extension in required_extensions.into_iter()
-        {
-            println!("{}", extension.0);
-        }
-
-        println!("-----------------------");
     }
 }
