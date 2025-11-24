@@ -11,6 +11,7 @@ use std::any::Any;
 #[derive(Component, Default)]
 pub struct Mesh
 {
+    // TODO: Multiple material support for one mesh/entity
     pub filepath: String,
     pub has_been_initialized: bool, // Indicates if mesh data has been uploaded to the GPU or not
 

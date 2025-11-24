@@ -51,7 +51,13 @@ impl App
             usage: TextureUsage::Albedo,
         };
 
-        let material = Material { textures: vec![color_tex], ..Default::default() };
+        let material = Material {
+            name: "Object".to_string(),
+            vertex_shader_path: "src/graphics/shaders/base_vert.spv".to_string(),
+            fragment_shader_path: "src/graphics/shaders/base_frag.spv".to_string(),
+            textures: vec![color_tex],
+            has_been_initialized: false,
+        };
 
         let mesh_id = world.add_entity();
         world.add_component(mesh_id, mesh);

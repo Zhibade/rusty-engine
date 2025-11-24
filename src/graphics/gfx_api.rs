@@ -73,10 +73,19 @@ use winit::window::Window;
 const VIEW_PROJ_DESCRIPTOR_SET_LAYOUT_INDEX: usize = 0;
 const TEXTURES_DESCRIPTOR_SET_LAYOUT_INDEX: usize = 1;
 
-const VERTEX_SHADER_PATH: &str = "src/graphics/shaders/vert.spv";
-const FRAGMENT_SHADER_PATH: &str = "src/graphics/shaders/frag.spv";
+const FALLBACK_PIPELINE_NAME: &str = "Fallback";
+const FALLBACK_VERTEX_SHADER_PATH: &str = "src/graphics/shaders/base_vert.spv";
+const FALLBACK_FRAGMENT_SHADER_PATH: &str = "src/graphics/shaders/fallback_frag.spv";
+
 const DEFAULT_BLACK_TEXTURE_PATH: &str = "default-black";
-const TEXTURE_COUNT: u32 = 1; // Hard-coding texture count for now to match shader
+
+/// Shader/material pipeline and texture assignments data
+struct PipelineData
+{
+    graphics_pipeline: Arc<GraphicsPipeline>,
+    texture_assignments: HashMap<TextureUsage, String>,
+    textures_descriptor_set: Option<Arc<DescriptorSet>>,
+}
 
 /// Render mesh data after uploading to the GPU
 struct RenderMeshData
@@ -84,6 +93,8 @@ struct RenderMeshData
     vertex_buffer: Subbuffer<[VertexData]>,
     index_buffer: Subbuffer<[u32]>,
     transform_data: ObjectTransformData,
+
+    pipeline_data_id: String, // TODO: Might be better to use indexes/GUID?
 }
 
 /// Texture data after uploading to the GPU
@@ -145,7 +156,7 @@ pub struct GfxApi
     swapchain: Arc<Swapchain>,
     viewport: Viewport,
     render_pass: Arc<RenderPass>,
-    graphics_pipeline: Arc<GraphicsPipeline>,
+    pipeline_data: HashMap<String, PipelineData>, // Unique name -> Pipeline data
     framebuffers: Vec<Arc<Framebuffer>>,
     depth_stencil_format: Format,
 
@@ -154,11 +165,9 @@ pub struct GfxApi
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
 
-    // Rendering data that will be used in the shaders
+    // Shader data
     render_meshes_data: HashMap<String, RenderMeshData>,
-    texture_assignments: HashMap<TextureUsage, String>, // Currently used textures when drawing
     texture_data: HashMap<String, TextureData>,
-    texture_descriptor_set: Arc<DescriptorSet>,
     view_projection_data: ViewProjectionData, // Current camera (view-projection) data
     view_perspective_data_buffer: Subbuffer<ViewProjectionData>,
     view_perspective_data_descriptor_set: Arc<DescriptorSet>,
@@ -262,10 +271,6 @@ impl GfxApi
             Swapchain::new(device.clone(), surface, swapchain_create_info)
                 .expect("Failed to create swapchain");
 
-        // Load shaders
-        let (vert_shader_entry_point, frag_shader_entry_point) =
-            Self::load_shaders(device.clone(), VERTEX_SHADER_PATH, FRAGMENT_SHADER_PATH);
-
         // Find best depth buffer format
         let depth_stencil_format =
             Self::get_best_supported_depth_buffer_format(device.physical_device());
@@ -300,14 +305,20 @@ impl GfxApi
         // Create viewport
         let viewport = Viewport { extent: window.inner_size().into(), ..Default::default() };
 
-        // Create graphics pipeline
-        let graphics_pipeline = Self::create_graphics_pipeline(
+        // Create fallback shaders' graphics pipeline
+        let (vert_shader_entry_point, frag_shader_entry_point) = Self::load_shaders(
+            device.clone(),
+            FALLBACK_VERTEX_SHADER_PATH,
+            FALLBACK_FRAGMENT_SHADER_PATH,
+        );
+
+        let fallback_graphics_pipeline = Self::create_graphics_pipeline(
             &device,
             &swapchain,
             &render_pass,
             vert_shader_entry_point,
             frag_shader_entry_point,
-            TEXTURE_COUNT,
+            0,
         );
 
         // Create memory allocators
@@ -338,7 +349,7 @@ impl GfxApi
             view_projection_data.clone(),
         );
 
-        let view_perspective_descriptor_set_layout = graphics_pipeline
+        let view_perspective_descriptor_set_layout = fallback_graphics_pipeline
             .layout()
             .set_layouts()
             .get(VIEW_PROJ_DESCRIPTOR_SET_LAYOUT_INDEX)
@@ -369,30 +380,16 @@ impl GfxApi
             Vec::from([(default_image_data, &default_texture)]),
         );
 
-        let texture_descriptor_set_layout = graphics_pipeline
-            .layout()
-            .set_layouts()
-            .get(TEXTURES_DESCRIPTOR_SET_LAYOUT_INDEX)
-            .unwrap()
-            .clone();
-
-        let default_texture_data =
-            default_texture_data_map.get(DEFAULT_BLACK_TEXTURE_PATH).unwrap();
-
-        let texture_descriptor_set = DescriptorSet::new(
-            descriptor_set_allocator.clone(),
-            texture_descriptor_set_layout,
-            [WriteDescriptorSet::image_view_sampler(
-                0,
-                default_texture_data.image_view.clone(),
-                default_texture_data.sampler.clone(),
-            )],
-            [],
-        )
-        .unwrap();
-
-        let mut texture_assignments = HashMap::new();
-        texture_assignments.insert(TextureUsage::Albedo, String::from(DEFAULT_BLACK_TEXTURE_PATH));
+        // Register fallback pipeline data
+        let mut pipeline_data = HashMap::new();
+        pipeline_data.insert(
+            FALLBACK_PIPELINE_NAME.to_string(),
+            PipelineData {
+                graphics_pipeline: fallback_graphics_pipeline,
+                texture_assignments: HashMap::new(),
+                textures_descriptor_set: None,
+            },
+        );
 
         GfxApi {
             device,
@@ -400,16 +397,14 @@ impl GfxApi
             swapchain,
             viewport,
             render_pass,
-            graphics_pipeline,
+            pipeline_data,
             framebuffers,
             depth_stencil_format,
             memory_allocator,
             command_buffer_allocator,
             descriptor_set_allocator,
             render_meshes_data: HashMap::new(),
-            texture_assignments,
             texture_data: default_texture_data_map,
-            texture_descriptor_set,
             view_projection_data,
             view_perspective_data_buffer,
             view_perspective_data_descriptor_set,
@@ -491,7 +486,7 @@ impl GfxApi
             queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
-            .unwrap();
+        .unwrap();
 
         let mut new_texture_data = HashMap::new();
 
@@ -513,7 +508,7 @@ impl GfxApi
                 staging_buffer_alloc_create_info,
                 image_data.data,
             )
-                .unwrap();
+            .unwrap();
 
             // Create GPU image buffer
             let image_format =
@@ -545,7 +540,7 @@ impl GfxApi
                 image_create_info,
                 AllocationCreateInfo::default(),
             )
-                .unwrap();
+            .unwrap();
 
             // Create image view, sampler, and then add to texture data collection
             let image_view = ImageView::new_default(image.clone()).unwrap();
@@ -678,7 +673,7 @@ impl GfxApi
             staging_allocation_create_info.clone(),
             vertices,
         )
-            .unwrap();
+        .unwrap();
 
         let vertex_buffer_create_info = BufferCreateInfo {
             usage: BufferUsage::VERTEX_BUFFER | BufferUsage::TRANSFER_DST,
@@ -691,7 +686,7 @@ impl GfxApi
             device_local_allocation_create_info.clone(),
             num_of_vertices as DeviceSize,
         )
-            .unwrap();
+        .unwrap();
 
         // Create index buffer
         let index_staging_buffer = Buffer::from_iter(
@@ -700,7 +695,7 @@ impl GfxApi
             staging_allocation_create_info,
             mesh.indices.clone(),
         )
-            .unwrap();
+        .unwrap();
 
         let index_buffer_create_info = BufferCreateInfo {
             usage: BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST,
@@ -713,7 +708,7 @@ impl GfxApi
             device_local_allocation_create_info,
             mesh.indices.len() as DeviceSize,
         )
-            .unwrap();
+        .unwrap();
 
         // Copy buffers to GPU using a temporary command buffer
         let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
@@ -721,7 +716,7 @@ impl GfxApi
             queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
-            .unwrap();
+        .unwrap();
 
         let vertex_copy_buffer_info =
             CopyBufferInfo::buffers(vertex_staging_buffer, vertex_buffer.clone());
@@ -769,7 +764,7 @@ impl GfxApi
             allocation_create_info,
             view_projection_data,
         )
-            .unwrap()
+        .unwrap()
     }
 
     /// Create and initialize the graphics pipeline that will be used for rendering
@@ -865,7 +860,7 @@ impl GfxApi
                 device.clone(),
                 textures_descriptor_set_layout_create_info,
             )
-                .unwrap();
+            .unwrap();
 
             descriptor_set_layouts.push(textures_descriptor_set_layout);
         };
@@ -933,7 +928,7 @@ impl GfxApi
                 depth_stencil_image_create_info,
                 depth_stencil_allocation_info,
             )
-                .expect("Failed to create depth stencil image");
+            .expect("Failed to create depth stencil image");
 
             let depth_stencil_image_view =
                 ImageView::new_default(depth_stencil_image.clone()).unwrap();
@@ -1105,7 +1100,12 @@ impl GfxApi
     }
 
     /// Initialize a new mesh for rendering (upload data to GPU)
-    pub fn init_mesh(&mut self, mesh: &Mesh, transform_matrix: [[f32; 4]; 4])
+    pub fn init_mesh(
+        &mut self,
+        mesh: &Mesh,
+        transform_matrix: [[f32; 4]; 4],
+        material_name: &String,
+    )
     {
         // Check first if mesh isn't already loaded
         // TODO: Add support for multiple instances of same mesh
@@ -1123,14 +1123,72 @@ impl GfxApi
         );
 
         let transform_data = ObjectTransformData { matrix: transform_matrix };
-        let render_mesh_data = RenderMeshData { vertex_buffer, index_buffer, transform_data };
+        let render_mesh_data = RenderMeshData {
+            vertex_buffer,
+            index_buffer,
+            transform_data,
+            pipeline_data_id: material_name.clone(),
+        };
 
         self.render_meshes_data.insert(mesh.filepath.clone(), render_mesh_data);
     }
 
-    /// Initialize new textures for rendering (upload data to GPU)
-    pub fn init_textures(&mut self, mut image_data: Vec<(ImageData, &Texture)>)
+    /// Initialize vertex and fragment shaders pair
+    /// # Panics
+    /// Will panic if any of the shader files is not found or corrupted
+    pub fn init_shaders(
+        &mut self,
+        vertex_shader_path: &str,
+        fragment_shader_path: &str,
+        material_name: &String,
+        texture_count: u32,
+    )
     {
+        // Load shaders and initialize pipeline
+        let (vert_shader_entry_point, frag_shader_entry_point) =
+            Self::load_shaders(self.device.clone(), vertex_shader_path, fragment_shader_path);
+
+        let graphics_pipeline = Self::create_graphics_pipeline(
+            &self.device,
+            &self.swapchain,
+            &self.render_pass,
+            vert_shader_entry_point,
+            frag_shader_entry_point,
+            texture_count, // Could maybe get this via fragment shader entry point?
+        );
+
+        // Add/update pipeline data (textures data has to be updated with init_textures)
+        let pipeline_data = PipelineData {
+            graphics_pipeline,
+            texture_assignments: HashMap::new(),
+            textures_descriptor_set: None,
+        };
+
+        self.pipeline_data.insert(material_name.clone(), pipeline_data);
+    }
+
+    /// Initialize new textures for rendering (upload data to GPU)
+    ///
+    /// Textures are assigned to specific materials (the data itself is reused if used on multiple),
+    /// so make sure to pass the correct material name for the corresponding material
+    pub fn init_textures(
+        &mut self,
+        mut image_data: Vec<(ImageData, &Texture)>,
+        material_name: &String,
+    )
+    {
+        // Check first that the pipeline data is already initialized
+        if !self.pipeline_data.contains_key(material_name)
+        {
+            println!(
+                "Pipeline data for {material_name} is not initialized.\
+            Please initialize shader/pipeline data first with init_shaders"
+            );
+
+            return;
+        }
+
+        // Allocate textures and assign them to the corresponding pipeline
         let mut new_texture_indices = Vec::new();
 
         for (i, (_, texture)) in image_data.iter_mut().enumerate()
@@ -1151,8 +1209,11 @@ impl GfxApi
             }
 
             // Assign textures based on usage
-            // TODO: This needs to be handled per material, not have a single global assignment
-            self.texture_assignments.insert(texture.usage.clone(), texture.filepath.clone());
+            self.pipeline_data
+                .get_mut(material_name)
+                .unwrap()
+                .texture_assignments
+                .insert(texture.usage.clone(), texture.filepath.clone());
         }
 
         // Allocate all new texture samplers
@@ -1178,8 +1239,11 @@ impl GfxApi
         }
 
         // Update texture descriptor set
+        let texture_assignments =
+            &self.pipeline_data.get(material_name).unwrap().texture_assignments;
         let mut texture_bindings = Vec::new();
-        for (texture_usage, filepath) in self.texture_assignments.iter()
+        
+        for (texture_usage, filepath) in texture_assignments.iter()
         {
             let texture_data = self.texture_data.get(filepath).unwrap();
 
@@ -1192,8 +1256,13 @@ impl GfxApi
             texture_bindings.push(write_descriptor_set);
         }
 
-        let descriptor_set_layout = self
-            .graphics_pipeline
+        let graphics_pipeline = &self
+            .pipeline_data
+            .get(material_name)
+            .expect(format!("Failed to get graphics pipeline with name: {material_name}").as_str())
+            .graphics_pipeline;
+
+        let descriptor_set_layout = graphics_pipeline
             .layout()
             .set_layouts()
             .get(TEXTURES_DESCRIPTOR_SET_LAYOUT_INDEX)
@@ -1208,7 +1277,8 @@ impl GfxApi
         )
         .unwrap();
 
-        self.texture_descriptor_set = texture_descriptor_set;
+        self.pipeline_data.get_mut(material_name).unwrap().textures_descriptor_set =
+            Some(texture_descriptor_set);
     }
 
     /// Record and execute rendering commands once the next frame image is ready
@@ -1251,30 +1321,51 @@ impl GfxApi
             .begin_render_pass(render_pass_begin_info, Default::default())
             .unwrap()
             .set_viewport(0, [self.viewport.clone()].into_iter().collect())
-            .unwrap()
-            .bind_pipeline_graphics(self.graphics_pipeline.clone())
-            .unwrap()
-            .bind_descriptor_sets(
-                PipelineBindPoint::Graphics,
-                self.graphics_pipeline.layout().clone(),
-                0,
-                Vec::from([
-                    self.view_perspective_data_descriptor_set.clone(),
-                    self.texture_descriptor_set.clone(),
-                ]),
-            )
-            .ok();
+            .expect("An error occurred when setting up the command buffer's viewport");
 
         // Draw each mesh
         for (_, mesh_data) in self.render_meshes_data.iter()
         {
+            // Get corresponding graphics pipeline data and textures descriptor set
+            let pipeline_data = {
+                if !self.pipeline_data.contains_key(&mesh_data.pipeline_data_id)
+                {
+                    println!(
+                        "Pipeline data for [{}] not found. Using fallback pipeline/shaders",
+                        &mesh_data.pipeline_data_id
+                    );
+
+                    self.pipeline_data.get(&FALLBACK_PIPELINE_NAME.to_string()).unwrap()
+                }
+                else
+                {
+                    self.pipeline_data.get(&mesh_data.pipeline_data_id).unwrap()
+                }
+            };
+
+            let mut descriptor_sets = vec![self.view_perspective_data_descriptor_set.clone()];
+
+            if let Some(ref textures_descriptor_set) = pipeline_data.textures_descriptor_set
+            {
+                descriptor_sets.push(textures_descriptor_set.clone());
+            }
+
             command_buffer_builder
+                .bind_pipeline_graphics(pipeline_data.graphics_pipeline.clone())
+                .unwrap()
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    pipeline_data.graphics_pipeline.layout().clone(),
+                    0,
+                    descriptor_sets,
+                )
+                .unwrap()
                 .bind_vertex_buffers(0, mesh_data.vertex_buffer.clone())
                 .unwrap()
                 .bind_index_buffer(mesh_data.index_buffer.clone())
                 .unwrap()
                 .push_constants(
-                    self.graphics_pipeline.layout().clone(),
+                    pipeline_data.graphics_pipeline.layout().clone(),
                     0,
                     mesh_data.transform_data.clone(),
                 )
@@ -1378,8 +1469,15 @@ impl GfxApi
         let mut buffer_write = self.view_perspective_data_buffer.write().unwrap();
         *buffer_write = self.view_projection_data.clone();
 
-        let descriptor_set_layout = self
-            .graphics_pipeline
+        // View projection descriptor set is always the same on all shaders,
+        // so just use the fallback pipeline to retrieve the layout
+        let graphics_pipeline = &self
+            .pipeline_data
+            .get(FALLBACK_PIPELINE_NAME)
+            .expect("Failed retrieving fallback graphics pipeline")
+            .graphics_pipeline;
+
+        let descriptor_set_layout = graphics_pipeline
             .layout()
             .set_layouts()
             .get(VIEW_PROJ_DESCRIPTOR_SET_LAYOUT_INDEX)

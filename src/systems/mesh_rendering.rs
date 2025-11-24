@@ -1,5 +1,6 @@
 //! Mesh rendering system implementation
 
+use crate::components::material::Material;
 use crate::components::mesh::Mesh;
 use crate::components::transform::Transform;
 use crate::core::world::World;
@@ -37,17 +38,22 @@ impl System for MeshRenderingSystem
     {
         let mut gfx_api_ref = self.gfx_api.borrow_mut();
 
-        // Get mesh and transform components
-        for (mesh_rc, transform_rc) in world.query_pair::<Mesh, Transform>()
+        // Get mesh, transform, and material components
+        for (mesh_rc, transform_rc, material_rc) in world.query_trio::<Mesh, Transform, Material>()
         {
             let mut mesh = mesh_rc.borrow_mut();
             let transform = transform_rc.borrow();
+            let material = material_rc.borrow();
 
             // Initialize mesh if it is its first update
             // Otherwise just update transform if there have been changes
             if !mesh.has_been_initialized
             {
-                gfx_api_ref.init_mesh(mesh.deref(), transform.matrix.to_cols_array_2d());
+                gfx_api_ref.init_mesh(
+                    mesh.deref(),
+                    transform.matrix.to_cols_array_2d(),
+                    &material.name,
+                );
                 mesh.has_been_initialized = true;
             }
             else if transform.has_been_changed

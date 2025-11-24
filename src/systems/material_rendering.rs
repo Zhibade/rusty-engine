@@ -31,12 +31,21 @@ impl System for MaterialRenderingSystem
     {
         let mut gfx_api_ref = self.gfx_api.borrow_mut();
 
-        // Initialize textures in materials
+        // Initialize shaders and textures in materials
         for material in world.query::<Material>()
         {
             let mut material_ref = material.borrow_mut();
             if !material_ref.has_been_initialized
             {
+                // Have to initialize shaders first, otherwise texture assignments can't be done
+                gfx_api_ref.init_shaders(
+                    &material_ref.vertex_shader_path,
+                    &material_ref.fragment_shader_path,
+                    &material_ref.name,
+                    material_ref.textures.len() as u32,
+                );
+
+                // Initialize textures
                 let mut texture_data = Vec::new();
 
                 for texture in material_ref.textures.iter()
@@ -45,7 +54,7 @@ impl System for MaterialRenderingSystem
                     texture_data.push((image_data, texture));
                 }
 
-                gfx_api_ref.init_textures(texture_data);
+                gfx_api_ref.init_textures(texture_data, &material_ref.name);
                 material_ref.has_been_initialized = true;
             }
         }

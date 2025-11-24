@@ -32,9 +32,14 @@ pub struct Texture
 }
 
 /// Shader parameters that will be used when rendering a mesh
-#[derive(Component, Default)]
+#[derive(Component)]
 pub struct Material
 {
-    pub has_been_initialized: bool,
+    // TODO: Multiple material support for one mesh/entity
+    pub name: String,
+    pub vertex_shader_path: String,
+    pub fragment_shader_path: String,
     pub textures: Vec<Texture>,
+
+    pub has_been_initialized: bool,
 }

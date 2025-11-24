@@ -183,6 +183,40 @@ impl World
         components
     }
 
+    /// Query for all existing component trios of the given types
+    pub fn query_trio<T: Component, U: Component, V: Component>(
+        &self,
+    ) -> Vec<(Rc<RefCell<T>>, Rc<RefCell<U>>, Rc<RefCell<V>>)>
+    {
+        let mut components = Vec::new();
+        let type_id_t = TypeId::of::<T>();
+        let type_id_u = TypeId::of::<U>();
+        let type_id_v = TypeId::of::<V>();
+
+        // Component combinations should be cached already, so just use the cache to retrieve them
+        let mut component_cache_key = Vec::from([type_id_t, type_id_u, type_id_v]);
+        component_cache_key.sort();
+
+        if self.entity_component_cache.contains_key(&component_cache_key)
+        {
+            for entity_id in self.entity_component_cache.get(&component_cache_key).unwrap().iter()
+            {
+                let component_t = self.get_component::<T>(entity_id.clone());
+                let component_u = self.get_component::<U>(entity_id.clone());
+                let component_v = self.get_component::<V>(entity_id.clone());
+
+                if component_t.is_none() || component_u.is_none() || component_v.is_none()
+                {
+                    continue;
+                }
+
+                components.push((component_t.unwrap(), component_u.unwrap(), component_v.unwrap()));
+            }
+        }
+
+        components
+    }
+
     /// Register a new system type in the world
     ///
     /// System's update method will be run every frame
