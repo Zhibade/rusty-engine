@@ -28,6 +28,7 @@ pub struct Texture
 {
     pub filepath: String,
     pub is_rgb: bool,
+    pub is_cubemap: bool,
     pub usage: TextureUsage,
 }
 

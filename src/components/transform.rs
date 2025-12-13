@@ -20,4 +20,13 @@ impl Transform
     {
         Transform { matrix: Mat4::from_translation(position), has_been_changed: false }
     }
+
+    /// Create a new [Transform] component using the given scale
+    pub fn from_scale(scale: Vec3) -> Self
+    {
+        Transform {
+            matrix: Mat4::from_scale(scale),
+            has_been_changed: false,
+        }
+    }
 }

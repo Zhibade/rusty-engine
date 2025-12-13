@@ -2,7 +2,7 @@
 
 use crate::components::material::{Texture, TextureUsage};
 use crate::components::mesh::Mesh;
-use crate::loaders::image_loader::ImageData;
+use crate::loaders::image_loader::{ImageData, PixelData};
 use std::cmp;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
@@ -34,9 +34,10 @@ use vulkano::format::{Format, FormatFeatures};
 use vulkano::image::sampler::{
     Filter, LOD_CLAMP_NONE, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode,
 };
-use vulkano::image::view::ImageView;
+use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
 use vulkano::image::{
-    Image, ImageCreateInfo, ImageLayout, ImageSubresourceLayers, ImageTiling, ImageType, ImageUsage,
+    Image, ImageCreateFlags, ImageCreateInfo, ImageLayout, ImageSubresourceLayers, ImageTiling,
+    ImageType, ImageUsage,
 };
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions};
 use vulkano::library::VulkanLibrary;
@@ -369,6 +370,7 @@ impl GfxApi
         let default_texture = Texture {
             filepath: String::from(DEFAULT_BLACK_TEXTURE_PATH),
             is_rgb: true,
+            is_cubemap: false,
             usage: TextureUsage::Albedo,
         };
 
@@ -492,31 +494,27 @@ impl GfxApi
 
         for (image_data, texture) in image_data
         {
-            // Create a temporary staging buffer for sending image data to GPU
-            let staging_buffer_create_info =
-                BufferCreateInfo { usage: BufferUsage::TRANSFER_SRC, ..Default::default() };
+            // Create GPU image buffer
+            let image_format = match image_data.data
+            {
+                PixelData::SDR(_) =>
+                {
+                    if texture.is_rgb { Format::R8G8B8A8_SRGB } else { Format::R8G8B8A8_SNORM }
+                }
 
-            let staging_buffer_alloc_create_info = AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
+                PixelData::HDR(_) => Format::R32G32B32A32_SFLOAT,
             };
 
-            let staging_buffer = Buffer::from_iter(
-                memory_allocator.clone(),
-                staging_buffer_create_info,
-                staging_buffer_alloc_create_info,
-                image_data.data,
-            )
-            .unwrap();
-
-            // Create GPU image buffer
-            let image_format =
-                if texture.is_rgb { Format::R8G8B8A8_SRGB } else { Format::R8G8B8A8_SNORM };
-
             let mipmap_num = {
-                let largest_dimension = cmp::max(image_data.size[0], image_data.size[1]);
-                if largest_dimension < 2 { 1 } else { largest_dimension.ilog2() }
+                let mut largest_side = cmp::max(image_data.size[0], image_data.size[1]);
+
+                // Cubemap size is per face (current texture should have all faces lined up)
+                if texture.is_cubemap
+                {
+                    largest_side = largest_side.div_ceil(6);
+                }
+
+                if largest_side < 2 { 1 } else { largest_side.ilog2() }
             };
 
             let mut image_usage = ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED;
@@ -526,13 +524,32 @@ impl GfxApi
                 image_usage = image_usage | ImageUsage::TRANSFER_SRC;
             }
 
-            let image_create_info = ImageCreateInfo {
-                image_type: ImageType::Dim2d,
-                format: image_format,
-                extent: [image_data.size[0], image_data.size[1], 1],
-                mip_levels: mipmap_num,
-                usage: image_usage,
-                ..Default::default()
+            let image_create_info = {
+                let mut create_info = ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format: image_format,
+                    extent: [image_data.size[0], image_data.size[1], 1],
+                    mip_levels: mipmap_num,
+                    usage: image_usage,
+                    ..Default::default()
+                };
+
+                if texture.is_cubemap
+                {
+                    create_info.flags = ImageCreateFlags::CUBE_COMPATIBLE;
+
+                    // Cube maps are handled as an image with 6 layers (cube faces),
+                    // so the image extent should only be the size for one face.
+                    // Currently supported texture expects all faces to be lined up horizontally
+                    // so need to divide by 6
+                    let face_extent = cmp::max(image_data.size[0], image_data.size[1]).div_ceil(6);
+
+                    create_info.extent[0] = face_extent;
+                    create_info.extent[1] = face_extent;
+                    create_info.array_layers = 6; // 6 faces
+                }
+
+                create_info
             };
 
             let image = Image::new(
@@ -540,10 +557,22 @@ impl GfxApi
                 image_create_info,
                 AllocationCreateInfo::default(),
             )
-            .unwrap();
+            .expect(format!("Failed to create image for {}", texture.filepath).as_str());
 
             // Create image view, sampler, and then add to texture data collection
-            let image_view = ImageView::new_default(image.clone()).unwrap();
+            let image_view_create_info = {
+                let mut create_info = ImageViewCreateInfo::from_image(&image);
+
+                if texture.is_cubemap
+                {
+                    create_info.view_type = ImageViewType::Cube;
+                }
+
+                create_info
+            };
+
+            let image_view = ImageView::new(image.clone(), image_view_create_info)
+                .expect(format!("Failed to create image view for {}", texture.filepath).as_str());
 
             let sampler_create_info = SamplerCreateInfo {
                 mag_filter: Filter::Linear,
@@ -559,11 +588,81 @@ impl GfxApi
             let texture_data = TextureData { image_view, sampler };
             new_texture_data.insert(texture.filepath.clone(), texture_data);
 
-            // Register GPU copy command
-            let copy_buffer_to_image_info =
-                CopyBufferToImageInfo::buffer_image(staging_buffer, image.clone());
+            // Create a temporary staging buffer for sending image data to GPU
+            let staging_buffer_create_info =
+                BufferCreateInfo { usage: BufferUsage::TRANSFER_SRC, ..Default::default() };
 
-            command_buffer_builder.copy_buffer_to_image(copy_buffer_to_image_info).ok();
+            let staging_buffer_alloc_create_info = AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            };
+
+            // Register GPU copy command
+            let copy_buffer_to_image_info = match image_data.data
+            {
+                // Unfortunately need to repeat the buffer creation code for SDR and HDR due
+                // to the data types
+                PixelData::SDR(data) =>
+                {
+                    let staging_buffer = match Buffer::from_iter(
+                        memory_allocator.clone(),
+                        staging_buffer_create_info,
+                        staging_buffer_alloc_create_info,
+                        data,
+                    )
+                    {
+                        Ok(v) => v,
+                        Err(e) =>
+                        {
+                            println!(
+                                "GfxApi :: Error :: An error occurred while \
+                                creating buffer for image {} :: {}. \
+                                Skipping image upload.",
+                                texture.filepath, e
+                            );
+
+                            continue;
+                        }
+                    };
+
+                    CopyBufferToImageInfo::buffer_image(staging_buffer, image.clone())
+                }
+
+                PixelData::HDR(data) =>
+                {
+                    let staging_buffer = match Buffer::from_iter(
+                        memory_allocator.clone(),
+                        staging_buffer_create_info,
+                        staging_buffer_alloc_create_info,
+                        data,
+                    )
+                    {
+                        Ok(v) => v,
+                        Err(e) =>
+                        {
+                            println!(
+                                "GfxApi :: Error :: An error occurred while \
+                                creating buffer for image {} :: {}. \
+                                Skipping image upload.",
+                                texture.filepath, e
+                            );
+
+                            continue;
+                        }
+                    };
+
+                    CopyBufferToImageInfo::buffer_image(staging_buffer, image.clone())
+                }
+            };
+
+            command_buffer_builder.copy_buffer_to_image(copy_buffer_to_image_info).expect(
+                format!(
+                    "Failed to register copy buffer to image command for: {}",
+                    texture.filepath
+                )
+                .as_str(),
+            );
 
             // Generate mipmaps
             let image_width = image.extent()[0];
@@ -1242,7 +1341,7 @@ impl GfxApi
         let texture_assignments =
             &self.pipeline_data.get(material_name).unwrap().texture_assignments;
         let mut texture_bindings = Vec::new();
-        
+
         for (texture_usage, filepath) in texture_assignments.iter()
         {
             let texture_data = self.texture_data.get(filepath).unwrap();
@@ -1319,7 +1418,7 @@ impl GfxApi
 
         command_buffer_builder
             .begin_render_pass(render_pass_begin_info, Default::default())
-            .unwrap()
+            .expect("An error occurred when beginning the render pass")
             .set_viewport(0, [self.viewport.clone()].into_iter().collect())
             .expect("An error occurred when setting up the command buffer's viewport");
 
@@ -1350,34 +1449,38 @@ impl GfxApi
                 descriptor_sets.push(textures_descriptor_set.clone());
             }
 
+            let id = &mesh_data.pipeline_data_id;
+
             command_buffer_builder
                 .bind_pipeline_graphics(pipeline_data.graphics_pipeline.clone())
-                .unwrap()
+                .expect(format!("Failed to bind pipeline for {}", id).as_str())
                 .bind_descriptor_sets(
                     PipelineBindPoint::Graphics,
                     pipeline_data.graphics_pipeline.layout().clone(),
                     0,
                     descriptor_sets,
                 )
-                .unwrap()
+                .expect(format!("Failed to bind descriptor sets for {}", id).as_str())
                 .bind_vertex_buffers(0, mesh_data.vertex_buffer.clone())
-                .unwrap()
+                .expect(format!("Failed to bind vertex buffer for {}", id).as_str())
                 .bind_index_buffer(mesh_data.index_buffer.clone())
-                .unwrap()
+                .expect(format!("Failed to bind index buffer for {}", id).as_str())
                 .push_constants(
                     pipeline_data.graphics_pipeline.layout().clone(),
                     0,
                     mesh_data.transform_data.clone(),
                 )
-                .ok();
+                .expect(format!("Failed to set push constants for {}", id).as_str());
 
             unsafe {
                 command_buffer_builder.draw_indexed(mesh_data.index_buffer.len() as u32, 1, 0, 0, 0)
             }
-            .ok();
+            .expect(format!("Failed to register draw call for {}", id).as_str());
         }
 
-        command_buffer_builder.end_render_pass(Default::default()).ok();
+        command_buffer_builder
+            .end_render_pass(Default::default())
+            .expect("Failed to end render pass");
 
         // Submit command buffer, present when previous frame ends and image becomes available,
         // then signal fence once presentation is finished

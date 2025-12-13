@@ -45,24 +45,48 @@ impl App
         // Add mesh entity with material
         let mesh = mesh_loader::load_mesh("assets/models/test_sphere.gltf");
 
-        let color_tex = Texture {
+        let mesh_color_tex = Texture {
             filepath: String::from("assets/textures/uv_checker.png"),
             is_rgb: true,
+            is_cubemap: false,
             usage: TextureUsage::Albedo,
         };
 
-        let material = Material {
+        let mesh_material = Material {
             name: "Object".to_string(),
             vertex_shader_path: "src/graphics/shaders/base_vert.spv".to_string(),
             fragment_shader_path: "src/graphics/shaders/base_frag.spv".to_string(),
-            textures: vec![color_tex],
+            textures: vec![mesh_color_tex],
             has_been_initialized: false,
         };
 
         let mesh_id = world.add_entity();
         world.add_component(mesh_id, mesh);
-        world.add_component(mesh_id, material);
+        world.add_component(mesh_id, mesh_material);
         world.add_component(mesh_id, Transform::default());
+
+        // Add skybox
+        let skybox_mesh = mesh_loader::load_mesh("assets/models/skybox.gltf");
+
+        let skybox_tex = Texture {
+            filepath: "assets/textures/skybox.exr".to_string(),
+            is_rgb: true,
+            is_cubemap: true,
+            usage: TextureUsage::Albedo,
+        };
+
+        let skybox_material = Material {
+            name: "Skybox".to_string(),
+            vertex_shader_path: "src/graphics/shaders/skybox_vert.spv".to_string(),
+            fragment_shader_path: "src/graphics/shaders/skybox_frag.spv".to_string(),
+            textures: vec![skybox_tex],
+            has_been_initialized: false,
+        };
+
+        let skybox_id = world.add_entity();
+        world.add_component(skybox_id, skybox_mesh);
+        world.add_component(skybox_id, skybox_material);
+        world.add_component(skybox_id, Transform::from_scale(Vec3::new(99.0, 99.0, 99.0)));
 
         // Register camera and mesh systems
         let mesh_rendering_system = MeshRenderingSystem::new(self.gfx_api.clone().unwrap());

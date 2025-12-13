@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 derive-macros = { path = "derive-macros" }
+exr = "1.74.0"
 glam = "0.30.7"
 gltf = "1.4.1"
 png = "0.18.0"
