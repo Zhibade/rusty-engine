@@ -826,13 +826,14 @@ impl GfxApi
                         Ok(v) => v,
                         Err(e) =>
                         {
-                            println!(
-                                "GfxApi :: Error :: An error occurred while \
-                                creating buffer for image {} :: {}. \
+                            let error_msg = format!(
+                                "allocate_texture_samplers :: An error occurred while \
+                                creating buffer for SDR image {} :: {}. \
                                 Skipping image upload.",
                                 texture.filepath, e
                             );
 
+                            Self::log_error(error_msg.as_str());
                             continue;
                         }
                     };
@@ -852,13 +853,14 @@ impl GfxApi
                         Ok(v) => v,
                         Err(e) =>
                         {
-                            println!(
-                                "GfxApi :: Error :: An error occurred while \
-                                creating buffer for image {} :: {}. \
+                            let error_msg = format!(
+                                "allocate_texture_samplers :: An error occurred while \
+                                creating buffer for HDR image {} :: {}. \
                                 Skipping image upload.",
                                 texture.filepath, e
                             );
 
+                            Self::log_error(error_msg.as_str());
                             continue;
                         }
                     };
@@ -1416,6 +1418,12 @@ impl GfxApi
         }
     }
 
+    /// Log error with the given message
+    fn log_error(message: &str)
+    {
+        println!("Error :: GfxApi :: {message}");
+    }
+
     /// Utility function for converting device type to a string slice for logging
     #[cfg(debug_assertions)]
     fn get_device_type_name(device_type: &PhysicalDeviceType) -> &str
@@ -1553,11 +1561,12 @@ impl GfxApi
         // Check first that the pipeline data is already initialized
         if !self.pipeline_data.contains_key(material_name)
         {
-            println!(
-                "Pipeline data for {material_name} is not initialized.\
+            let err_msg = format!(
+                "init_textures :: Pipeline data for {material_name} is not initialized.\
                 Please initialize shader/pipeline data first with init_shaders"
             );
 
+            Self::log_error(err_msg.as_str());
             return;
         }
 
@@ -1741,10 +1750,12 @@ impl GfxApi
             let pipeline_data = {
                 if !self.pipeline_data.contains_key(&mesh_data.pipeline_data_id)
                 {
-                    println!(
-                        "Pipeline data for [{}] not found. Using fallback pipeline/shaders",
+                    let err_msg = format!(
+                        "render :: Pipeline data for [{}] not found. Using fallback pipeline/shaders",
                         &mesh_data.pipeline_data_id
                     );
+
+                    Self::log_error(err_msg.as_str());
 
                     self.pipeline_data.get(&FALLBACK_PIPELINE_NAME.to_string()).unwrap()
                 }
@@ -1838,7 +1849,7 @@ impl GfxApi
 
             Err(err) =>
             {
-                println!("Failed to flush present fence: {err}");
+                Self::log_error(format!("render :: Failed to flush present fence: {err}").as_str());
                 self.previous_frame_end = None;
             }
         }
@@ -1867,11 +1878,12 @@ impl GfxApi
         }
         else
         {
-            #[cfg(debug_assertions)]
-            println!(
-                "GfxApi :: update_mesh_transform :: Mesh: {filepath} ::\
+            let err_msg = format!(
+                "update_mesh_transform :: Mesh: {filepath} ::\
                 Mesh has not been initialized. Ignoring call."
-            )
+            );
+
+            Self::log_error(err_msg.as_str());
         }
     }
 
