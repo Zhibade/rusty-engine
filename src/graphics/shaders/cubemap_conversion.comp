@@ -1,0 +1,66 @@
+#version 450
+
+#define PI 3.1415926535897932384626433832795
+
+// When multiplied, it is recommended that the total value is in the range 128 - 512 for better occupancy
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Input equirectangular image
+layout(binding = 0) uniform sampler2D inputImage;
+
+// Output cubemap (6 square faces as an array)
+layout(binding = 1) uniform writeonly image2DArray outputCubemap;
+
+// Cubemap layer index (w coord/face) and 0-1 UV to base 3D coordinates conversion (order is X+, X-, Y+, Y-, Z+, Z-)
+// UV coords are multipliers only for changing the sign
+vec3 U_COORDS[] = vec3[](
+	vec3(0, 0, -1),
+	vec3(0, 0, 1),
+	vec3(1, 0, 0),
+	vec3(1, 0, 0),
+	vec3(1, 0, 0),
+	vec3(-1, 0, 0)
+);
+
+// Y coord is inverted to match Vulkan V's value (it is reversed)
+vec3 V_COORDS[] = vec3[](
+	vec3(0, -1, 0),
+	vec3(0, -1, 0),
+	vec3(0, 0, 1),
+	vec3(0, 0, -1),
+	vec3(0, -1, 0),
+	vec3(0, -1, 0)
+);
+
+// W coords are already in the range -0.5 - 0.5
+vec3 W_COORDS[] = vec3[](
+	vec3(0.5, 0, 0),
+	vec3(-0.5, 0, 0),
+	vec3(0, 0.5, 0),
+	vec3(0, -0.5, 0),
+	vec3(0, 0, 0.5),
+	vec3(0, 0, -0.5)
+);
+
+void main()
+{
+	vec2 faceUv = (gl_GlobalInvocationID.xy + 0.5) / imageSize(outputCubemap).xy;
+
+	// Get normalized cubemap 3D coords from UV and current face (layer index)
+	// UV coords are mapped to -0.5 - 0.5 range first, then signs are flipped if needed depending on the cubemap face
+	vec3 uCoords = (faceUv.x - 0.5) * U_COORDS[gl_GlobalInvocationID.z];
+	vec3 vCoords = (faceUv.y - 0.5) * V_COORDS[gl_GlobalInvocationID.z];
+	vec3 cubeCoords = uCoords + vCoords + W_COORDS[gl_GlobalInvocationID.z];
+
+	// Convert 3D coords (cartesian) to spherical coords
+	// (Y and Z axes are swapped from the standard equation to match renderer's axes)
+	float r = sqrt(cubeCoords.x * cubeCoords.x + cubeCoords.y * cubeCoords.y + cubeCoords.z * cubeCoords.z);
+	float theta = atan(cubeCoords.z, cubeCoords.x);
+	float phi = acos(cubeCoords.y / r);
+
+	// Convert to UV in equirectangular image, fetch pixel and update output cubemap pixel
+	vec2 uv = vec2(theta / (2 * PI), phi / PI);
+	vec4 color = texture(inputImage, uv);
+
+	imageStore(outputCubemap, ivec3(gl_GlobalInvocationID.xy, gl_GlobalInvocationID.z), color);
+}

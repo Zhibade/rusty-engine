@@ -16,11 +16,12 @@ use vulkano::command_buffer::allocator::{
 };
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, BlitImageInfo, CommandBufferExecFuture, CommandBufferUsage,
-    CopyBufferInfo, CopyBufferToImageInfo, ImageBlit, PrimaryCommandBufferAbstract,
-    RenderPassBeginInfo,
+    CopyBufferInfo, CopyBufferToImageInfo, ImageBlit, PrimaryAutoCommandBuffer,
+    PrimaryCommandBufferAbstract, RenderPassBeginInfo,
 };
 use vulkano::descriptor_set::allocator::{
-    StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo,
+    DescriptorSetAllocator, StandardDescriptorSetAllocator,
+    StandardDescriptorSetAllocatorCreateInfo,
 };
 use vulkano::descriptor_set::layout::{
     DescriptorSetLayout, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo, DescriptorType,
@@ -44,6 +45,7 @@ use vulkano::library::VulkanLibrary;
 use vulkano::memory::allocator::{
     AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator,
 };
+use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::GraphicsPipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
 use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
@@ -54,7 +56,7 @@ use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
 use vulkano::pipeline::graphics::viewport::{Scissor, Viewport, ViewportState};
 use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
 use vulkano::pipeline::{
-    DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
+    ComputePipeline, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
 use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
@@ -74,6 +76,7 @@ use winit::window::Window;
 const VIEW_PROJ_DESCRIPTOR_SET_LAYOUT_INDEX: usize = 0;
 const TEXTURES_DESCRIPTOR_SET_LAYOUT_INDEX: usize = 1;
 
+const CUBEMAP_CONVERSION_SHADER_PATH: &str = "src/graphics/shaders/cubemap_conversion_comp.spv";
 const FALLBACK_PIPELINE_NAME: &str = "Fallback";
 const FALLBACK_VERTEX_SHADER_PATH: &str = "src/graphics/shaders/base_vert.spv";
 const FALLBACK_FRAGMENT_SHADER_PATH: &str = "src/graphics/shaders/fallback_frag.spv";
@@ -153,11 +156,13 @@ pub struct GfxApi
 {
     // Base objects/data needed for drawing
     device: Arc<Device>,
-    queue: Arc<Queue>,
+    graphics_queue: Arc<Queue>,
+    compute_queue: Arc<Queue>,
     swapchain: Arc<Swapchain>,
     viewport: Viewport,
     render_pass: Arc<RenderPass>,
     pipeline_data: HashMap<String, PipelineData>, // Unique name -> Pipeline data
+    cubemap_conversion_pipeline: Arc<ComputePipeline>,
     framebuffers: Vec<Arc<Framebuffer>>,
     depth_stencil_format: Format,
 
@@ -219,7 +224,7 @@ impl GfxApi
         let device_extensions =
             DeviceExtensions { khr_swapchain: true, ..DeviceExtensions::empty() };
 
-        let (physical_device, queue_family_index) =
+        let (physical_device, graphics_queue_index, compute_queue_index) =
             GfxApi::get_best_physical_device_and_queue(&instance, &event_loop, &device_extensions);
 
         let physical_device_properties = physical_device.properties();
@@ -231,19 +236,42 @@ impl GfxApi
             Self::get_device_type_name(&physical_device_properties.device_type)
         );
 
+        // Create QueueCreateInfos
+        let queue_create_infos = {
+            let mut create_infos = Vec::from([QueueCreateInfo {
+                queue_family_index: graphics_queue_index,
+                ..Default::default()
+            }]);
+
+            // Create a separate QueueCreateInfo for compute if it is different from graphics
+            if graphics_queue_index != compute_queue_index
+            {
+                create_infos.push(QueueCreateInfo {
+                    queue_family_index: compute_queue_index,
+                    ..Default::default()
+                });
+            }
+
+            create_infos
+        };
+
         // Initialize logical device from physical device and store queue for later
         let device_create_info = DeviceCreateInfo {
             enabled_extensions: device_extensions,
-            queue_create_infos: Vec::from([QueueCreateInfo {
-                queue_family_index,
-                ..Default::default()
-            }]),
+            queue_create_infos,
             ..Default::default()
         };
 
         let (device, mut queues) = Device::new(physical_device, device_create_info)
             .expect("Failed to create logical device");
-        let queue = queues.next().unwrap(); // Using first queue only for now
+
+        let graphics_queue = queues
+            .find(|queue| queue.queue_family_index() == graphics_queue_index)
+            .expect("Could not find graphics queue in logical device");
+
+        let compute_queue = queues
+            .find(|queue| queue.queue_family_index() == compute_queue_index)
+            .expect("Could not find compute queue in logical device");
 
         // Create surface and swapchain
         let surface = Surface::from_window(instance.clone(), window.clone())
@@ -307,11 +335,11 @@ impl GfxApi
         let viewport = Viewport { extent: window.inner_size().into(), ..Default::default() };
 
         // Create fallback shaders' graphics pipeline
-        let (vert_shader_entry_point, frag_shader_entry_point) = Self::load_shaders(
-            device.clone(),
-            FALLBACK_VERTEX_SHADER_PATH,
-            FALLBACK_FRAGMENT_SHADER_PATH,
-        );
+        let vert_shader_entry_point =
+            Self::load_shader(device.clone(), FALLBACK_VERTEX_SHADER_PATH);
+
+        let frag_shader_entry_point =
+            Self::load_shader(device.clone(), FALLBACK_FRAGMENT_SHADER_PATH);
 
         let fallback_graphics_pipeline = Self::create_graphics_pipeline(
             &device,
@@ -321,6 +349,9 @@ impl GfxApi
             frag_shader_entry_point,
             0,
         );
+
+        // Create cubemap conversion compute pipeline
+        let cubemap_conversion_pipeline = Self::create_cubemap_conversion_compute_pipeline(&device);
 
         // Create memory allocators
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
@@ -378,7 +409,7 @@ impl GfxApi
             memory_allocator.clone(),
             command_buffer_allocator.clone(),
             device.clone(),
-            queue.clone(),
+            graphics_queue.clone(),
             Vec::from([(default_image_data, &default_texture)]),
         );
 
@@ -395,11 +426,13 @@ impl GfxApi
 
         GfxApi {
             device,
-            queue,
+            graphics_queue,
+            compute_queue,
             swapchain,
             viewport,
             render_pass,
             pipeline_data,
+            cubemap_conversion_pipeline,
             framebuffers,
             depth_stencil_format,
             memory_allocator,
@@ -417,35 +450,85 @@ impl GfxApi
     }
 
     /// Find the best physical device that supports required extensions
+    /// Physical device, graphics queue index, and compute queue index are returned
     fn get_best_physical_device_and_queue(
         instance: &Arc<Instance>,
         event_loop: &ActiveEventLoop,
         device_extensions: &DeviceExtensions,
-    ) -> (Arc<PhysicalDevice>, u32)
+    ) -> (Arc<PhysicalDevice>, u32, u32)
     {
-        let (physical_device, queue_family_index) = instance
+        let (physical_device, graphics_queue_family_index, compute_queue_family_index) = instance
             .enumerate_physical_devices()
-            .unwrap()
+            .expect("Failed to retrieve available physical devices")
             .filter_map(|device| {
-                // Check if it supports required extensions and queue family
+                // Check if it supports required extensions and queue families
                 if device.supported_extensions().contains(&device_extensions)
                 {
-                    device
-                        .queue_family_properties()
-                        .iter()
-                        .enumerate()
-                        .position(|(i, queue)| {
-                            queue.queue_flags.intersects(QueueFlags::GRAPHICS)
+                    let mut graphics_queue_index: Option<u32> = None;
+                    let mut compute_queue_index: Option<u32> = None;
+                    let mut fallback_compute_queue_index: Option<u32>;
+
+                    let queue_iter = device.queue_family_properties().iter().enumerate();
+                    let queue_num = queue_iter.len();
+
+                    for (i, queue) in queue_iter
+                    {
+                        // Find first valid graphics queue
+                        if graphics_queue_index.is_none()
+                        {
+                            if queue.queue_flags.intersects(QueueFlags::GRAPHICS)
                                 && device.presentation_support(i as u32, event_loop).unwrap()
-                        })
-                        .map(|index| (device, index as u32))
+                            {
+                                graphics_queue_index = Some(i as u32);
+                            }
+                        }
+
+                        // Find best compute queue index
+                        if compute_queue_index.is_none()
+                        {
+                            if queue.queue_flags.intersects(QueueFlags::COMPUTE)
+                            {
+                                let compute_index = i as u32;
+                                fallback_compute_queue_index = Some(compute_index);
+
+                                // A separate queue from graphics is better, so prioritize it if found
+                                if let Some(graphics_index) = graphics_queue_index
+                                {
+                                    if compute_index != graphics_index
+                                    {
+                                        compute_queue_index = Some(compute_index);
+                                    }
+                                }
+
+                                // Use the same as graphics if no other compute queue is found
+                                if queue_num == i + 1 && compute_queue_index.is_none()
+                                {
+                                    compute_queue_index = fallback_compute_queue_index;
+                                }
+                            }
+                        }
+
+                        if graphics_queue_index.is_some() && compute_queue_index.is_some()
+                        {
+                            break;
+                        }
+                    }
+
+                    if graphics_queue_index.is_some() && compute_queue_index.is_some()
+                    {
+                        Some((device, graphics_queue_index, compute_queue_index))
+                    }
+                    else
+                    {
+                        None
+                    }
                 }
                 else
                 {
                     None
                 }
             })
-            .min_by_key(|(device, _)| {
+            .min_by_key(|(device, _, _)| {
                 // Find the best candidate based on the priority below
                 match device.properties().device_type
                 {
@@ -459,7 +542,7 @@ impl GfxApi
             })
             .expect("No suitable physical device found");
 
-        (physical_device, queue_family_index)
+        (physical_device, graphics_queue_family_index.unwrap(), compute_queue_family_index.unwrap())
     }
 
     /// Get validation layers to be used depending on build configuration
@@ -473,48 +556,215 @@ impl GfxApi
         Vec::new()
     }
 
-    /// Allocate a texture and its sampler using the given [ImageData] and [Texture] data
+    /// Allocate cubemap textures and convert them from equirectangular projection to a cubemap
+    /// texture layout so that they can be read correctly by Vulkan
+    fn allocate_cubemap_samplers(
+        memory_allocator: Arc<dyn MemoryAllocator>,
+        command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+        descriptor_set_allocator: Arc<dyn DescriptorSetAllocator>,
+        graphics_queue: Arc<Queue>,
+        compute_queue: Arc<Queue>,
+        compute_pipeline: Arc<ComputePipeline>,
+        cubemap_texture_data: Vec<(&str, &TextureData)>,
+    ) -> HashMap<String, TextureData>
+    {
+        let mut new_cubemap_data = HashMap::new();
+
+        // Create temporary command buffer for executing cubemap conversion shader
+        let mut compute_command_buffer_builder = AutoCommandBufferBuilder::primary(
+            command_buffer_allocator.clone(),
+            compute_queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .expect("Failed to create compute command buffer for cubemap conversion");
+
+        // Create temporary command buffer for generating mipmaps
+        let mut graphics_command_buffer_builder = AutoCommandBufferBuilder::primary(
+            command_buffer_allocator.clone(),
+            graphics_queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .expect("Failed to create graphics command buffer for cubemap mipmap generation");
+
+        // Create target (per-face) cubemap textures and execute compute shader per texture
+        for (path, texture_data) in cubemap_texture_data
+        {
+            // Calculate image extents and mipmaps
+            // Equirectangular image width is usually 4 times the face size
+            let face_size = texture_data.image_view.image().extent()[0] / 4;
+            let mipmap_num = if face_size < 2 { 1 } else { face_size.ilog2() };
+
+            // Using STORAGE usage since it is going to be generated in the compute shader
+            let mut image_usage = ImageUsage::SAMPLED | ImageUsage::STORAGE;
+
+            if mipmap_num > 1
+            {
+                // Only set as transfer source and destination when generating mipmaps
+                image_usage = image_usage | ImageUsage::TRANSFER_SRC | ImageUsage::TRANSFER_DST;
+            }
+
+            let image_create_info = {
+                // Cube maps are handled as an image with 6 layers (cube faces),
+                // so the image extent should only be the size for one face
+                ImageCreateInfo {
+                    flags: ImageCreateFlags::CUBE_COMPATIBLE,
+                    image_type: ImageType::Dim2d,
+                    format: texture_data.image_view.format(),
+                    extent: [face_size, face_size, 1],
+                    array_layers: 6, // 6 faces
+                    mip_levels: mipmap_num,
+                    usage: image_usage,
+                    ..Default::default()
+                }
+            };
+
+            let image = Image::new(
+                memory_allocator.clone(),
+                image_create_info,
+                AllocationCreateInfo::default(),
+            )
+            .expect(format!("Failed to create target cubemap image for {}", path).as_str());
+
+            // Create image view for compute shader
+            // Need to make it 2D array instead of cube for easier processing
+            // (processing each face separately)
+            let image_view_create_info = ImageViewCreateInfo {
+                view_type: ImageViewType::Dim2dArray,
+                ..ImageViewCreateInfo::from_image(&image)
+            };
+
+            let image_view = ImageView::new(image.clone(), image_view_create_info)
+                .expect(format!("Failed to create target image view for {}", path).as_str());
+
+            // Create descriptor sets
+            let input_write_descriptor_set = WriteDescriptorSet::image_view_sampler(
+                0,
+                texture_data.image_view.clone(),
+                texture_data.sampler.clone(),
+            );
+
+            let output_write_descriptor_set = WriteDescriptorSet::image_view(1, image_view.clone());
+
+            let descriptor_set = DescriptorSet::new(
+                descriptor_set_allocator.clone(),
+                compute_pipeline.layout().set_layouts()[0].clone(),
+                [input_write_descriptor_set, output_write_descriptor_set],
+                [],
+            )
+            .expect("Failed to create cubemap conversion's descriptor set");
+
+            // Register compute shader command
+            compute_command_buffer_builder
+                .bind_pipeline_compute(compute_pipeline.clone())
+                .expect("Failed to bind cubemap conversion compute pipeline")
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Compute,
+                    compute_pipeline.layout().clone(),
+                    0,
+                    descriptor_set,
+                )
+                .expect("Failed to bind cubemap conversion descriptor sets");
+
+            unsafe {
+                compute_command_buffer_builder
+                    .dispatch([face_size / 16, face_size / 16, 6]) // 16 x 16 threads x 6 faces
+                    .expect("Failed to dispatch cubemap conversion compute shader");
+            }
+
+            // Register mipmap generation for cubemap in graphics queue
+            Self::register_mipmap_generation_commands(
+                &mut graphics_command_buffer_builder,
+                &image,
+                mipmap_num,
+            );
+
+            // Create actual cubemap image view and store it with current sampler so that it is
+            // updated after this function returns
+            let cube_image_view_create_info = ImageViewCreateInfo {
+                view_type: ImageViewType::Cube,
+                ..ImageViewCreateInfo::from_image(&image)
+            };
+
+            let cube_image_view = ImageView::new(image.clone(), cube_image_view_create_info)
+                .expect(format!("Failed to create cubemap image view for {}", path).as_str());
+
+            let new_texture_data =
+                TextureData { image_view: cube_image_view, sampler: texture_data.sampler.clone() };
+
+            new_cubemap_data.insert(String::from(path), new_texture_data);
+        }
+
+        // Execute compute command buffer and wait until it is done
+        compute_command_buffer_builder
+            .build()
+            .expect("Failed to build cubemap conversion's compute command buffer builder")
+            .execute(compute_queue.clone())
+            .expect("Failed to upload image to GPU")
+            .then_signal_fence_and_flush()
+            .expect("Failed to register fence signal for cubemap conversion compute execute")
+            .wait(None) // Block until image is copied
+            .expect("Failed to wait for cubemap conversion compute's signal");
+
+        // Execute graphics command buffer (for mipmap generation) and wait until it is done
+        graphics_command_buffer_builder
+            .build()
+            .expect("Failed to build cubemap mipmap generation graphics command buffer builder")
+            .execute(graphics_queue.clone())
+            .expect("Failed to execute cubemap mipmap generation command buffer")
+            .then_signal_fence_and_flush()
+            .expect("Failed to register fence signal for cubemap mipmap generation execute")
+            .wait(None) // Block until image is copied
+            .expect("Failed to wait for cubemap mipmap generation's signal");
+
+        new_cubemap_data
+    }
+
+    /// Allocate multiple textures and their samplers using the given [ImageData] and [Texture] data
     fn allocate_texture_samplers(
         memory_allocator: Arc<dyn MemoryAllocator>,
         command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
         device: Arc<Device>,
-        queue: Arc<Queue>,
+        graphics_queue: Arc<Queue>,
         image_data: Vec<(ImageData, &Texture)>,
     ) -> HashMap<String, TextureData>
     {
+        let mut new_texture_data = HashMap::new();
+
         // Create temporary command buffer for copying textures to GPU
         let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
             command_buffer_allocator,
-            queue.queue_family_index(),
+            graphics_queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
         .unwrap();
 
-        let mut new_texture_data = HashMap::new();
-
         for (image_data, texture) in image_data
         {
-            // Create GPU image buffer
-            let image_format = match image_data.data
-            {
-                PixelData::SDR(_) =>
-                {
-                    if texture.is_rgb { Format::R8G8B8A8_SRGB } else { Format::R8G8B8A8_SNORM }
-                }
+            // Create a temporary staging buffer for sending image data to GPU
+            let staging_buffer_create_info =
+                BufferCreateInfo { usage: BufferUsage::TRANSFER_SRC, ..Default::default() };
 
-                PixelData::HDR(_) => Format::R32G32B32A32_SFLOAT,
+            let staging_buffer_alloc_create_info = AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
             };
 
-            let mipmap_num = {
-                let mut largest_side = cmp::max(image_data.size[0], image_data.size[1]);
+            // Create GPU image buffer
+            let image_format = Self::get_image_format_from_image_data(&image_data, texture);
 
-                // Cubemap size is per face (current texture should have all faces lined up)
+            let mipmap_num = {
+                // Cubemaps are generated by a compute shader,
+                // so don't need mipmaps until after they are generated
                 if texture.is_cubemap
                 {
-                    largest_side = largest_side.div_ceil(6);
+                    1
                 }
-
-                if largest_side < 2 { 1 } else { largest_side.ilog2() }
+                else
+                {
+                    let largest_side = cmp::max(image_data.size[0], image_data.size[1]);
+                    if largest_side < 2 { 1 } else { largest_side.ilog2() }
+                }
             };
 
             let mut image_usage = ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED;
@@ -524,32 +774,13 @@ impl GfxApi
                 image_usage = image_usage | ImageUsage::TRANSFER_SRC;
             }
 
-            let image_create_info = {
-                let mut create_info = ImageCreateInfo {
-                    image_type: ImageType::Dim2d,
-                    format: image_format,
-                    extent: [image_data.size[0], image_data.size[1], 1],
-                    mip_levels: mipmap_num,
-                    usage: image_usage,
-                    ..Default::default()
-                };
-
-                if texture.is_cubemap
-                {
-                    create_info.flags = ImageCreateFlags::CUBE_COMPATIBLE;
-
-                    // Cube maps are handled as an image with 6 layers (cube faces),
-                    // so the image extent should only be the size for one face.
-                    // Currently supported texture expects all faces to be lined up horizontally
-                    // so need to divide by 6
-                    let face_extent = cmp::max(image_data.size[0], image_data.size[1]).div_ceil(6);
-
-                    create_info.extent[0] = face_extent;
-                    create_info.extent[1] = face_extent;
-                    create_info.array_layers = 6; // 6 faces
-                }
-
-                create_info
+            let image_create_info = ImageCreateInfo {
+                image_type: ImageType::Dim2d,
+                format: image_format,
+                extent: [image_data.size[0], image_data.size[1], 1],
+                mip_levels: mipmap_num,
+                usage: image_usage,
+                ..Default::default()
             };
 
             let image = Image::new(
@@ -560,17 +791,7 @@ impl GfxApi
             .expect(format!("Failed to create image for {}", texture.filepath).as_str());
 
             // Create image view, sampler, and then add to texture data collection
-            let image_view_create_info = {
-                let mut create_info = ImageViewCreateInfo::from_image(&image);
-
-                if texture.is_cubemap
-                {
-                    create_info.view_type = ImageViewType::Cube;
-                }
-
-                create_info
-            };
-
+            let image_view_create_info = ImageViewCreateInfo::from_image(&image);
             let image_view = ImageView::new(image.clone(), image_view_create_info)
                 .expect(format!("Failed to create image view for {}", texture.filepath).as_str());
 
@@ -587,16 +808,6 @@ impl GfxApi
 
             let texture_data = TextureData { image_view, sampler };
             new_texture_data.insert(texture.filepath.clone(), texture_data);
-
-            // Create a temporary staging buffer for sending image data to GPU
-            let staging_buffer_create_info =
-                BufferCreateInfo { usage: BufferUsage::TRANSFER_SRC, ..Default::default() };
-
-            let staging_buffer_alloc_create_info = AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            };
 
             // Register GPU copy command
             let copy_buffer_to_image_info = match image_data.data
@@ -665,55 +876,18 @@ impl GfxApi
             );
 
             // Generate mipmaps
-            let image_width = image.extent()[0];
-            let image_height = image.extent()[1];
-
-            // For each mipmap, downscale previous mipmap by half
-            let mut next_mipmap_width = image_width;
-            let mut next_mipmap_height = image_height;
-
-            if mipmap_num > 1
-            {
-                for i in 1..mipmap_num
-                {
-                    let src_subresource_layer =
-                        ImageSubresourceLayers { mip_level: i - 1, ..image.subresource_layers() };
-
-                    let dst_subresource_layer =
-                        ImageSubresourceLayers { mip_level: i, ..image.subresource_layers() };
-
-                    let previous_width = next_mipmap_width;
-                    let previous_height = next_mipmap_height;
-
-                    next_mipmap_width = cmp::max(1, next_mipmap_width / 2);
-                    next_mipmap_height = cmp::max(1, next_mipmap_height / 2);
-
-                    let blit_region = ImageBlit {
-                        src_subresource: src_subresource_layer,
-                        src_offsets: [[0; 3], [previous_width, previous_height, 1]],
-                        dst_subresource: dst_subresource_layer,
-                        dst_offsets: [[0; 3], [next_mipmap_width, next_mipmap_height, 1]],
-                        ..Default::default()
-                    };
-
-                    let blit_image_info = BlitImageInfo {
-                        regions: Vec::from([blit_region]).into(),
-                        filter: Filter::Linear,
-                        ..BlitImageInfo::images(image.clone(), image.clone())
-                    };
-
-                    command_buffer_builder
-                        .blit_image(blit_image_info)
-                        .expect(format!("Failed to generate mipmap {i}").as_str());
-                }
-            }
+            Self::register_mipmap_generation_commands(
+                &mut command_buffer_builder,
+                &image,
+                mipmap_num,
+            );
         }
 
         // Execute command buffer and wait until it is done
         command_buffer_builder
             .build()
             .unwrap()
-            .execute(queue.clone())
+            .execute(graphics_queue.clone())
             .expect("Failed to upload image to GPU")
             .then_signal_fence_and_flush()
             .unwrap()
@@ -721,6 +895,57 @@ impl GfxApi
             .ok();
 
         new_texture_data
+    }
+
+    /// Register mipmap generation blit commands
+    fn register_mipmap_generation_commands(
+        command_buffer_builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        image: &Arc<Image>,
+        mipmap_num: u32,
+    )
+    {
+        let image_width = image.extent()[0];
+        let image_height = image.extent()[1];
+
+        // For each mipmap, downscale previous mipmap by half
+        let mut next_mipmap_width = image_width;
+        let mut next_mipmap_height = image_height;
+
+        if mipmap_num > 1
+        {
+            for i in 1..mipmap_num
+            {
+                let src_subresource_layer =
+                    ImageSubresourceLayers { mip_level: i - 1, ..image.subresource_layers() };
+
+                let dst_subresource_layer =
+                    ImageSubresourceLayers { mip_level: i, ..image.subresource_layers() };
+
+                let previous_width = next_mipmap_width;
+                let previous_height = next_mipmap_height;
+
+                next_mipmap_width = cmp::max(1, next_mipmap_width / 2);
+                next_mipmap_height = cmp::max(1, next_mipmap_height / 2);
+
+                let blit_region = ImageBlit {
+                    src_subresource: src_subresource_layer,
+                    src_offsets: [[0; 3], [previous_width, previous_height, 1]],
+                    dst_subresource: dst_subresource_layer,
+                    dst_offsets: [[0; 3], [next_mipmap_width, next_mipmap_height, 1]],
+                    ..Default::default()
+                };
+
+                let blit_image_info = BlitImageInfo {
+                    regions: Vec::from([blit_region]).into(),
+                    filter: Filter::Linear,
+                    ..BlitImageInfo::images(image.clone(), image.clone())
+                };
+
+                command_buffer_builder
+                    .blit_image(blit_image_info)
+                    .expect(format!("Failed to generate mipmap {i}").as_str());
+            }
+        }
     }
 
     /// Allocate vertex and index buffers on the device using given [Mesh] data
@@ -864,6 +1089,55 @@ impl GfxApi
             view_projection_data,
         )
         .unwrap()
+    }
+
+    /// Create and initialize the compute pipeline for the cubemap conversion compute shader
+    fn create_cubemap_conversion_compute_pipeline(device: &Arc<Device>) -> Arc<ComputePipeline>
+    {
+        // Load shader and create shader stage create info
+        let shader = Self::load_shader(device.clone(), CUBEMAP_CONVERSION_SHADER_PATH);
+        let shader_stage_create_info = PipelineShaderStageCreateInfo::new(shader);
+
+        // Create descriptor set layout with input and output textures
+        let input_descriptor_set_layout_binding = DescriptorSetLayoutBinding {
+            descriptor_count: 1,
+            stages: ShaderStages::COMPUTE,
+            ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::CombinedImageSampler)
+        };
+
+        let output_descriptor_set_layout_binding = DescriptorSetLayoutBinding {
+            descriptor_count: 1,
+            stages: ShaderStages::COMPUTE,
+            ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::StorageImage)
+        };
+
+        let descriptor_set_layout_create_info = DescriptorSetLayoutCreateInfo {
+            bindings: BTreeMap::from([
+                (0, input_descriptor_set_layout_binding),
+                (1, output_descriptor_set_layout_binding),
+            ]),
+            ..DescriptorSetLayoutCreateInfo::default()
+        };
+
+        let descriptor_set_layout =
+            DescriptorSetLayout::new(device.clone(), descriptor_set_layout_create_info)
+                .expect("Failed to create cubemap compute input descriptor set layout");
+
+        // Create pipeline
+        let pipeline_layout_create_info = PipelineLayoutCreateInfo {
+            set_layouts: vec![descriptor_set_layout],
+            ..PipelineLayoutCreateInfo::default()
+        };
+
+        let pipeline_layout = PipelineLayout::new(device.clone(), pipeline_layout_create_info)
+            .expect("Failed to create cubemap compute pipeline layout");
+
+        let pipeline_create_info = ComputePipelineCreateInfo {
+            ..ComputePipelineCreateInfo::stage_layout(shader_stage_create_info, pipeline_layout)
+        };
+
+        ComputePipeline::new(device.clone(), None, pipeline_create_info)
+            .expect("Failed to create cubemap compute pipeline")
     }
 
     /// Create and initialize the graphics pipeline that will be used for rendering
@@ -1047,45 +1321,31 @@ impl GfxApi
         framebuffers
     }
 
-    /// Load vertex and fragment shader at the given paths
+    /// Load a shader from the given path
     ///
     /// # Panics
-    /// It will panic if any of the files doesn't exist, or if they are not correct shader files
-    fn load_shaders(
-        device: Arc<Device>,
-        vert_shader_path: impl AsRef<Path>,
-        frag_shader_path: impl AsRef<Path>,
-    ) -> (EntryPoint, EntryPoint)
+    /// It will panic if the file doesn't exist, or if it is not a valid shader file
+    fn load_shader(device: Arc<Device>, shader_path: impl AsRef<Path>) -> EntryPoint
     {
-        let paths = Vec::from([vert_shader_path.as_ref(), frag_shader_path.as_ref()]);
-        let mut entry_points = Vec::new();
+        let filepath = Path::new(env!("CARGO_MANIFEST_DIR")).join(shader_path);
+        let filepath_str = filepath.to_str().unwrap();
 
-        for path in paths
-        {
-            let filepath = Path::new(env!("CARGO_MANIFEST_DIR")).join(path);
+        let mut bytes = Vec::new();
+        let mut file =
+            File::open(&filepath).expect(&format!("Failed to open shader file {filepath_str}"));
 
-            let mut bytes = Vec::new();
-            let mut file = File::open(&filepath)
-                .expect(&format!("Failed to open shader file {}", filepath.to_str().unwrap()));
+        file.read_to_end(&mut bytes).expect(&format!("Failed to read shader file {filepath_str}"));
 
-            file.read_to_end(&mut bytes)
-                .expect(&format!("Failed to read shader file {}", filepath.to_str().unwrap()));
+        let shader_words = vulkano::shader::spirv::bytes_to_words(&bytes)
+            .expect("Failed to read shader words from file {filepath}");
 
-            let shader_words = vulkano::shader::spirv::bytes_to_words(&bytes)
-                .expect("Failed to read shader words from file {filepath}");
+        let shader_module_create_info = ShaderModuleCreateInfo::new(&shader_words);
+        let shader_module =
+            unsafe { ShaderModule::new(device.clone(), shader_module_create_info).unwrap() };
 
-            let shader_module_create_info = ShaderModuleCreateInfo::new(&shader_words);
-            let shader_module =
-                unsafe { ShaderModule::new(device.clone(), shader_module_create_info).unwrap() };
-
-            let entry_point = shader_module.entry_point("main").unwrap();
-            entry_points.push(entry_point);
-        }
-
-        let frag_entry_point = entry_points.pop().unwrap();
-        let vert_entry_point = entry_points.pop().unwrap();
-
-        (vert_entry_point, frag_entry_point)
+        shader_module
+            .entry_point("main")
+            .expect(&format!("Failed to get entry point for shader file {filepath_str}"))
     }
 
     /// Find the best supported format by the device for use as a depth buffer
@@ -1140,6 +1400,20 @@ impl GfxApi
         };
 
         best_depth_format.unwrap()
+    }
+
+    /// Get GPU image format from image data
+    fn get_image_format_from_image_data(image_data: &ImageData, texture: &Texture) -> Format
+    {
+        match image_data.data
+        {
+            PixelData::SDR(_) =>
+            {
+                if texture.is_rgb { Format::R8G8B8A8_SRGB } else { Format::R8G8B8A8_SNORM }
+            }
+
+            PixelData::HDR(_) => Format::R32G32B32A32_SFLOAT,
+        }
     }
 
     /// Utility function for converting device type to a string slice for logging
@@ -1217,7 +1491,7 @@ impl GfxApi
         let (vertex_buffer, index_buffer) = Self::allocate_vertex_data_buffers(
             self.memory_allocator.clone(),
             self.command_buffer_allocator.clone(),
-            self.queue.clone(),
+            self.graphics_queue.clone(),
             mesh,
         );
 
@@ -1244,8 +1518,8 @@ impl GfxApi
     )
     {
         // Load shaders and initialize pipeline
-        let (vert_shader_entry_point, frag_shader_entry_point) =
-            Self::load_shaders(self.device.clone(), vertex_shader_path, fragment_shader_path);
+        let vert_shader_entry_point = Self::load_shader(self.device.clone(), vertex_shader_path);
+        let frag_shader_entry_point = Self::load_shader(self.device.clone(), fragment_shader_path);
 
         let graphics_pipeline = Self::create_graphics_pipeline(
             &self.device,
@@ -1281,7 +1555,7 @@ impl GfxApi
         {
             println!(
                 "Pipeline data for {material_name} is not initialized.\
-            Please initialize shader/pipeline data first with init_shaders"
+                Please initialize shader/pipeline data first with init_shaders"
             );
 
             return;
@@ -1289,6 +1563,7 @@ impl GfxApi
 
         // Allocate textures and assign them to the corresponding pipeline
         let mut new_texture_indices = Vec::new();
+        let mut new_cubemap_paths = Vec::new();
 
         for (i, (_, texture)) in image_data.iter_mut().enumerate()
         {
@@ -1298,12 +1573,17 @@ impl GfxApi
                 #[cfg(debug_assertions)]
                 println!(
                     "GfxApi :: init_texture :: Texture {} :: Texture is already initialized.\
-                        Skipping initialization.",
+                    Skipping initialization.",
                     texture.filepath
                 );
             }
             else
             {
+                if texture.is_cubemap
+                {
+                    new_cubemap_paths.push(texture.filepath.as_str());
+                }
+
                 new_texture_indices.push(i);
             }
 
@@ -1315,7 +1595,7 @@ impl GfxApi
                 .insert(texture.usage.clone(), texture.filepath.clone());
         }
 
-        // Allocate all new texture samplers
+        // Allocate all new non-cubemap texture samplers
         let mut image_data_to_allocate = Vec::new();
         for index in new_texture_indices
         {
@@ -1330,11 +1610,43 @@ impl GfxApi
                 self.memory_allocator.clone(),
                 self.command_buffer_allocator.clone(),
                 self.device.clone(),
-                self.queue.clone(),
+                self.graphics_queue.clone(),
                 image_data_to_allocate,
             );
 
             self.texture_data.extend(new_texture_data);
+        }
+
+        // Allocate and convert new cubemap texture samplers
+        if !new_cubemap_paths.is_empty()
+        {
+            // Get cubemaps source texture data
+            let source_cubemap_data = {
+                let mut cubemap_data = Vec::new();
+                for path in new_cubemap_paths
+                {
+                    if let Some(data) = self.texture_data.get(path)
+                    {
+                        cubemap_data.push((path, data));
+                    }
+                }
+
+                cubemap_data
+            };
+
+            // Equirectangular images need to be converted to a actual cubemaps to be used
+            let new_cubemap_data = Self::allocate_cubemap_samplers(
+                self.memory_allocator.clone(),
+                self.command_buffer_allocator.clone(),
+                self.descriptor_set_allocator.clone(),
+                self.graphics_queue.clone(),
+                self.compute_queue.clone(),
+                self.cubemap_conversion_pipeline.clone(),
+                source_cubemap_data,
+            );
+
+            // Overwrite source equirectangular textures with the converted cubemap
+            self.texture_data.extend(new_cubemap_data);
         }
 
         // Update texture descriptor set
@@ -1403,7 +1715,7 @@ impl GfxApi
         // Allocate command buffer and record render pass
         let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
             self.command_buffer_allocator.clone(),
-            self.queue.queue_family_index(),
+            self.graphics_queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
         .expect("Failed to create command buffer builder");
@@ -1505,9 +1817,9 @@ impl GfxApi
         // Execute command buffer, present, and then signal fence
         let present_fence = sync::now(self.device.clone())
             .join(acquire_future)
-            .then_execute(self.queue.clone(), command_buffer)
+            .then_execute(self.graphics_queue.clone(), command_buffer)
             .unwrap()
-            .then_swapchain_present(self.queue.clone(), swapchain_present_info)
+            .then_swapchain_present(self.graphics_queue.clone(), swapchain_present_info)
             .then_signal_fence_and_flush();
 
         // Check fence's result once it is finished
