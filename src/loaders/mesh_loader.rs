@@ -45,8 +45,9 @@ pub fn load_mesh(filepath: impl AsRef<Path>) -> Mesh
     // Positions
     if let Some(positions) = mesh_data_reader.read_positions()
     {
+        // GLTF is right-handed, so need to invert Z axis
         positions.for_each(|position| {
-            mesh.vertices.push(Vec3::new(position[0], position[1] * 1.0, position[2]));
+            mesh.vertices.push(Vec3::new(position[0], position[1], position[2] * -1.0));
         });
     }
     else
@@ -67,8 +68,10 @@ pub fn load_mesh(filepath: impl AsRef<Path>) -> Mesh
     // Normals
     if let Some(normals) = mesh_data_reader.read_normals()
     {
-        normals
-            .for_each(|normal| mesh.normals.push(Vec3::new(normal[0], normal[1] * 1.0, normal[2])));
+        // GLTF is right-handed, so need to invert Z axis
+        normals.for_each(|normal| {
+            mesh.normals.push(Vec3::new(normal[0], normal[1], normal[2] * -1.0))
+        });
     }
     else
     {
@@ -79,8 +82,9 @@ pub fn load_mesh(filepath: impl AsRef<Path>) -> Mesh
     // TODO: Calculate using mikktspace when not present
     if let Some(tangents) = mesh_data_reader.read_tangents()
     {
+        // GLTF is right-handed, so need to invert Z axis
         tangents.for_each(|tangent| {
-            mesh.tangents.push(Vec3::new(tangent[0], tangent[1] * 1.0, tangent[2]))
+            mesh.tangents.push(Vec3::new(tangent[0], tangent[1], tangent[2] * -1.0))
         });
     }
     else
