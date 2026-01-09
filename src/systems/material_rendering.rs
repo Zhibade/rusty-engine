@@ -43,6 +43,7 @@ impl System for MaterialRenderingSystem
                     &material_ref.fragment_shader_path,
                     &material_ref.name,
                     material_ref.textures.len() as u32,
+                    material_ref.is_lit,
                 );
 
                 // Initialize textures

@@ -87,6 +87,7 @@ const DEFAULT_BLACK_TEXTURE_PATH: &str = "default-black";
 struct PipelineData
 {
     graphics_pipeline: Arc<GraphicsPipeline>,
+    uses_lighting: bool,
     texture_assignments: HashMap<TextureUsage, String>,
     textures_descriptor_set: Option<Arc<DescriptorSet>>,
 }
@@ -126,10 +127,10 @@ struct VertexData
     position: [f32; 3],
 
     #[format(R32G32B32_SFLOAT)]
-    normals: [f32; 3],
+    normal: [f32; 3],
 
     #[format(R32G32B32_SFLOAT)]
-    tangents: [f32; 3],
+    tangent: [f32; 3],
 
     #[format(R32G32_SFLOAT)]
     uv0: [f32; 2],
@@ -148,6 +149,15 @@ struct ViewProjectionData
 {
     view_matrix: [[f32; 4]; 4],
     perspective_matrix: [[f32; 4]; 4],
+}
+
+/// Image-based lighting data
+#[derive(BufferContents, Clone)]
+#[repr(C)]
+struct EnvironmentMapData
+{
+    exposure: f32,
+    angle: f32,
 }
 
 /// Graphics API interface
@@ -172,6 +182,13 @@ pub struct GfxApi
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
 
     // Shader data
+    environment_map_data: EnvironmentMapData,
+    environment_map_data_buffer: Subbuffer<EnvironmentMapData>,
+    environment_map_texture_data: TextureData,
+    environment_map_descriptor_set: Arc<DescriptorSet>,
+    updated_environment_map_data: bool,
+    updated_environment_map_texture: bool,
+
     render_meshes_data: HashMap<String, RenderMeshData>,
     texture_data: HashMap<String, TextureData>,
     view_projection_data: ViewProjectionData, // Current camera (view-projection) data
@@ -348,6 +365,7 @@ impl GfxApi
             vert_shader_entry_point,
             frag_shader_entry_point,
             0,
+            false,
         );
 
         // Create cubemap conversion compute pipeline
@@ -374,12 +392,41 @@ impl GfxApi
             depth_stencil_format,
         );
 
+        // Allocate placeholder environment map data
+        let environment_map_data = EnvironmentMapData { exposure: 1.0, angle: 0.0 };
+        let environment_map_data_buffer =
+            Self::allocate_data_buffer(memory_allocator.clone(), environment_map_data.clone());
+
+        let environment_map_texture_data = Self::allocate_environment_map_sampler(
+            memory_allocator.clone(),
+            command_buffer_allocator.clone(),
+            descriptor_set_allocator.clone(),
+            device.clone(),
+            graphics_queue.clone(),
+            compute_queue.clone(),
+            cubemap_conversion_pipeline.clone(),
+            ImageData::default_black_hdr(),
+        );
+
+        let environment_map_descriptor_set = DescriptorSet::new(
+            descriptor_set_allocator.clone(),
+            Self::get_environment_map_data_layout(device.clone()),
+            [
+                WriteDescriptorSet::buffer(0, environment_map_data_buffer.clone()),
+                WriteDescriptorSet::image_view_sampler(
+                    1,
+                    environment_map_texture_data.image_view.clone(),
+                    environment_map_texture_data.sampler.clone(),
+                ),
+            ],
+            [],
+        )
+        .expect("Failed to create default environment map descriptor set");
+
         // Allocate view and perspective projection data
         let view_projection_data = ViewProjectionData::default();
-        let view_perspective_data_buffer = Self::allocate_view_perspective_data_buffer(
-            memory_allocator.clone(),
-            view_projection_data.clone(),
-        );
+        let view_perspective_data_buffer =
+            Self::allocate_data_buffer(memory_allocator.clone(), view_projection_data.clone());
 
         let view_perspective_descriptor_set_layout = fallback_graphics_pipeline
             .layout()
@@ -419,12 +466,14 @@ impl GfxApi
             FALLBACK_PIPELINE_NAME.to_string(),
             PipelineData {
                 graphics_pipeline: fallback_graphics_pipeline,
+                uses_lighting: false,
                 texture_assignments: HashMap::new(),
                 textures_descriptor_set: None,
             },
         );
 
         GfxApi {
+            // Base objects/data needed for drawing
             device,
             graphics_queue,
             compute_queue,
@@ -435,14 +484,27 @@ impl GfxApi
             cubemap_conversion_pipeline,
             framebuffers,
             depth_stencil_format,
+
+            // Memory allocators
             memory_allocator,
             command_buffer_allocator,
             descriptor_set_allocator,
+
+            // Shader data
+            environment_map_data,
+            environment_map_data_buffer,
+            environment_map_texture_data,
+            environment_map_descriptor_set,
+            updated_environment_map_data: false,
+            updated_environment_map_texture: false,
+
             render_meshes_data: HashMap::new(),
             texture_data: default_texture_data_map,
             view_projection_data,
             view_perspective_data_buffer,
             view_perspective_data_descriptor_set,
+
+            // Data related to presenting onto the surface each frame
             should_recreate_swapchain: false,
             window_size: window.inner_size().into(),
             previous_frame_end: None,
@@ -591,7 +653,8 @@ impl GfxApi
         {
             // Calculate image extents and mipmaps
             // Equirectangular image width is usually 4 times the face size
-            let face_size = texture_data.image_view.image().extent()[0] / 4;
+            let face_size = (texture_data.image_view.image().extent()[0] / 4).max(1);
+
             let mipmap_num = if face_size < 2 { 1 } else { face_size.ilog2() };
 
             // Using STORAGE usage since it is going to be generated in the compute shader
@@ -717,6 +780,58 @@ impl GfxApi
             .expect("Failed to wait for cubemap mipmap generation's signal");
 
         new_cubemap_data
+    }
+
+    fn allocate_environment_map_sampler(
+        memory_allocator: Arc<dyn MemoryAllocator>,
+        command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+        descriptor_set_allocator: Arc<dyn DescriptorSetAllocator>,
+        device: Arc<Device>,
+        graphics_queue: Arc<Queue>,
+        compute_queue: Arc<Queue>,
+        compute_pipeline: Arc<ComputePipeline>,
+        image_data: ImageData,
+    ) -> TextureData
+    {
+        let texture_info = Texture {
+            filepath: String::from("environment_map"),
+            is_rgb: true,
+            is_cubemap: true,
+            ..Texture::default()
+        };
+
+        // Allocate source texture first (will be converted to actual cubemap later)
+        let allocated_texture_data = Self::allocate_texture_samplers(
+            memory_allocator.clone(),
+            command_buffer_allocator.clone(),
+            device.clone(),
+            graphics_queue.clone(),
+            vec![(image_data, &texture_info)],
+        );
+
+        let texture_data = allocated_texture_data
+            .get(&texture_info.filepath)
+            .expect("Failed to retrieve environment map source texture data");
+
+        // Convert texture to actual cubemap and update image and sampler
+        let allocated_cubemap_texture_data = Self::allocate_cubemap_samplers(
+            memory_allocator.clone(),
+            command_buffer_allocator.clone(),
+            descriptor_set_allocator.clone(),
+            graphics_queue.clone(),
+            compute_queue.clone(),
+            compute_pipeline.clone(),
+            vec![(texture_info.filepath.as_str(), texture_data)],
+        );
+
+        let cubemap_texture_data = allocated_cubemap_texture_data
+            .get(&texture_info.filepath)
+            .expect("Failed to retrieve environment map cubemap texture data");
+
+        TextureData {
+            image_view: cubemap_texture_data.image_view.clone(),
+            sampler: cubemap_texture_data.sampler.clone(),
+        }
     }
 
     /// Allocate multiple textures and their samplers using the given [ImageData] and [Texture] data
@@ -964,8 +1079,8 @@ impl GfxApi
         {
             let data = VertexData {
                 position: vertex.to_array(),
-                normals: mesh.normals[i].to_array(),
-                tangents: mesh.tangents[i].to_array(),
+                normal: mesh.normals[i].to_array(),
+                tangent: mesh.tangents[i].to_array(),
                 uv0: mesh.uv_sets[0][i].to_array(),
                 uv1: mesh.uv_sets[1][i].to_array(),
                 color: mesh.colors[i].to_array(),
@@ -1069,11 +1184,11 @@ impl GfxApi
         (vertex_buffer, index_buffer)
     }
 
-    /// Allocate view + perspective projection matrices data using given [MemoryAllocator]
-    fn allocate_view_perspective_data_buffer(
+    /// Allocate the given struct data using a [MemoryAllocator]
+    fn allocate_data_buffer<T: BufferContents>(
         memory_allocator: Arc<dyn MemoryAllocator>,
-        view_projection_data: ViewProjectionData,
-    ) -> Subbuffer<ViewProjectionData>
+        data: T,
+    ) -> Subbuffer<T>
     {
         let buffer_create_info =
             BufferCreateInfo { usage: BufferUsage::UNIFORM_BUFFER, ..Default::default() };
@@ -1084,13 +1199,8 @@ impl GfxApi
             ..Default::default()
         };
 
-        Buffer::from_data(
-            memory_allocator,
-            buffer_create_info,
-            allocation_create_info,
-            view_projection_data,
-        )
-        .unwrap()
+        Buffer::from_data(memory_allocator, buffer_create_info, allocation_create_info, data)
+            .unwrap()
     }
 
     /// Create and initialize the compute pipeline for the cubemap conversion compute shader
@@ -1150,6 +1260,7 @@ impl GfxApi
         vert_shader_entry_point: EntryPoint,
         frag_shader_entry_point: EntryPoint,
         texture_count: u32,
+        uses_lighting: bool,
     ) -> Arc<GraphicsPipeline>
     {
         let vertex_input_state =
@@ -1239,6 +1350,12 @@ impl GfxApi
 
             descriptor_set_layouts.push(textures_descriptor_set_layout);
         };
+
+        // If using lighting, create environment map data descriptor set layout
+        if uses_lighting
+        {
+            descriptor_set_layouts.push(Self::get_environment_map_data_layout(device.clone()));
+        }
 
         let pipeline_layout_create_info = PipelineLayoutCreateInfo {
             push_constant_ranges: Vec::from([push_constant_range]),
@@ -1404,6 +1521,33 @@ impl GfxApi
         best_depth_format.unwrap()
     }
 
+    /// Get environment map data (buffer + image and sampler) descriptor set layout
+    fn get_environment_map_data_layout(device: Arc<Device>) -> Arc<DescriptorSetLayout>
+    {
+        let environment_map_data_binding = DescriptorSetLayoutBinding {
+            descriptor_count: 1,
+            stages: ShaderStages::FRAGMENT,
+            ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
+        };
+
+        let environment_map_image_binding = DescriptorSetLayoutBinding {
+            descriptor_count: 1,
+            stages: ShaderStages::FRAGMENT,
+            ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::CombinedImageSampler)
+        };
+
+        let environment_map_layout_info = DescriptorSetLayoutCreateInfo {
+            bindings: BTreeMap::from([
+                (0, environment_map_data_binding),
+                (1, environment_map_image_binding),
+            ]),
+            ..DescriptorSetLayoutCreateInfo::default()
+        };
+
+        DescriptorSetLayout::new(device.clone(), environment_map_layout_info)
+            .expect("Failed to create environment map descriptor set layout")
+    }
+
     /// Get GPU image format from image data
     fn get_image_format_from_image_data(image_data: &ImageData, texture: &Texture) -> Format
     {
@@ -1480,6 +1624,27 @@ impl GfxApi
         self.window_size = new_size.into();
     }
 
+    /// Initializes the current environment map using the given [ImageData]\
+    /// If an environment map is already loaded, it will be replaced with the new one
+    pub fn init_environment_map(&mut self, image_data: ImageData)
+    {
+        let cubemap_texture_data = Self::allocate_environment_map_sampler(
+            self.memory_allocator.clone(),
+            self.command_buffer_allocator.clone(),
+            self.descriptor_set_allocator.clone(),
+            self.device.clone(),
+            self.graphics_queue.clone(),
+            self.compute_queue.clone(),
+            self.cubemap_conversion_pipeline.clone(),
+            image_data,
+        );
+
+        // Actual descriptor set will be updated after frame rendering is done
+        self.environment_map_texture_data.image_view = cubemap_texture_data.image_view.clone();
+        self.environment_map_texture_data.sampler = cubemap_texture_data.sampler.clone();
+        self.updated_environment_map_texture = true;
+    }
+
     /// Initialize a new mesh for rendering (upload data to GPU)
     pub fn init_mesh(
         &mut self,
@@ -1523,6 +1688,7 @@ impl GfxApi
         fragment_shader_path: &str,
         material_name: &String,
         texture_count: u32,
+        uses_lighting: bool,
     )
     {
         // Load shaders and initialize pipeline
@@ -1536,11 +1702,13 @@ impl GfxApi
             vert_shader_entry_point,
             frag_shader_entry_point,
             texture_count, // Could maybe get this via fragment shader entry point?
+            uses_lighting,
         );
 
         // Add/update pipeline data (textures data has to be updated with init_textures)
         let pipeline_data = PipelineData {
             graphics_pipeline,
+            uses_lighting,
             texture_assignments: HashMap::new(),
             textures_descriptor_set: None,
         };
@@ -1643,7 +1811,7 @@ impl GfxApi
                 cubemap_data
             };
 
-            // Equirectangular images need to be converted to a actual cubemaps to be used
+            // Equirectangular images need to be converted to an actual cubemaps to be used
             let new_cubemap_data = Self::allocate_cubemap_samplers(
                 self.memory_allocator.clone(),
                 self.command_buffer_allocator.clone(),
@@ -1767,9 +1935,16 @@ impl GfxApi
 
             let mut descriptor_sets = vec![self.view_perspective_data_descriptor_set.clone()];
 
+            // Add textures' descriptor set if it exists
             if let Some(ref textures_descriptor_set) = pipeline_data.textures_descriptor_set
             {
                 descriptor_sets.push(textures_descriptor_set.clone());
+            }
+
+            // Add lighting descriptor set if it uses lighting
+            if pipeline_data.uses_lighting
+            {
+                descriptor_sets.push(self.environment_map_descriptor_set.clone());
             }
 
             let id = &mesh_data.pipeline_data_id;
@@ -1821,6 +1996,7 @@ impl GfxApi
 
         // Update necessary buffers before execution
         self.update_view_projection_buffer();
+        self.update_lighting_buffers();
 
         let swapchain_present_info =
             SwapchainPresentInfo::swapchain_image_index(self.swapchain.clone(), image_index);
@@ -1867,6 +2043,18 @@ impl GfxApi
             ViewProjectionData { view_matrix, perspective_matrix: flipped_perspective_matrix };
     }
 
+    /// Update current image-based lighting settings
+    pub fn update_lighting(&mut self, exposure: f32, angle: f32)
+    {
+        if exposure != self.environment_map_data.exposure
+            || angle != self.environment_map_data.angle
+        {
+            self.environment_map_data.exposure = exposure;
+            self.environment_map_data.angle = angle;
+            self.updated_environment_map_data = true;
+        }
+    }
+
     /// Update specific mesh's transform
     ///
     /// Call will be ignored if mesh has not been initialized via `init_mesh`
@@ -1885,6 +2073,46 @@ impl GfxApi
 
             Self::log_error(err_msg.as_str());
         }
+    }
+
+    /// Update environment map lighting data buffer if needed
+    /// # Panics
+    /// Will panic if this is called while the GPU is using the uniform buffer\
+    /// Need to wait until the previous frame is finished processing before calling this function
+    fn update_lighting_buffers(&mut self)
+    {
+        // If data or texture has not changed, don't update anything
+        if !self.updated_environment_map_data && !self.updated_environment_map_texture
+        {
+            return;
+        }
+
+        // Check if lighting settings have changed and update buffer
+        if self.updated_environment_map_data
+        {
+            let mut buffer_write = self.environment_map_data_buffer.write().unwrap();
+            *buffer_write = self.environment_map_data.clone();
+        }
+
+        // Environment map descriptor set is always the same on all shaders, so just update it
+        self.environment_map_descriptor_set = DescriptorSet::new(
+            self.descriptor_set_allocator.clone(),
+            Self::get_environment_map_data_layout(self.device.clone()),
+            [
+                WriteDescriptorSet::buffer(0, self.environment_map_data_buffer.clone()),
+                WriteDescriptorSet::image_view_sampler(
+                    1,
+                    self.environment_map_texture_data.image_view.clone(),
+                    self.environment_map_texture_data.sampler.clone(),
+                ),
+            ],
+            [],
+        )
+        .expect("Failed to update view projection data buffer");
+
+        // Reset update flags
+        self.updated_environment_map_data = false;
+        self.updated_environment_map_texture = false;
     }
 
     /// Update view-projection buffer data from latest camera update

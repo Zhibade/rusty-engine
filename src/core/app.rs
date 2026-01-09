@@ -1,12 +1,14 @@
 //! Window application implementation
 
 use crate::components::camera::Camera;
+use crate::components::image_based_light::ImageBasedLight;
 use crate::components::material::{Material, Texture, TextureUsage};
 use crate::components::transform::Transform;
 use crate::core::world::World;
 use crate::graphics::gfx_api::GfxApi;
 use crate::loaders::mesh_loader;
 use crate::systems::camera_rendering::CameraRenderingSystem;
+use crate::systems::light_rendering::LightRenderingSystem;
 use crate::systems::material_rendering::MaterialRenderingSystem;
 use crate::systems::mesh_rendering::MeshRenderingSystem;
 use crate::systems::mesh_rotator::MeshRotatorSystem;
@@ -57,6 +59,7 @@ impl App
             vertex_shader_path: "src/graphics/shaders/base_vert.spv".to_string(),
             fragment_shader_path: "src/graphics/shaders/base_frag.spv".to_string(),
             textures: vec![mesh_color_tex],
+            is_lit: true,
             has_been_initialized: false,
         };
 
@@ -80,6 +83,7 @@ impl App
             vertex_shader_path: "src/graphics/shaders/skybox_vert.spv".to_string(),
             fragment_shader_path: "src/graphics/shaders/skybox_frag.spv".to_string(),
             textures: vec![skybox_tex],
+            is_lit: false,
             has_been_initialized: false,
         };
 
@@ -88,9 +92,19 @@ impl App
         world.add_component(skybox_id, skybox_material);
         world.add_component(skybox_id, Transform::from_scale(Vec3::new(99.0, 99.0, 99.0)));
 
-        // Register camera and mesh systems
+        // Add environment lighting (uses precomputed irradiance cubemap for now)
+        let env_light_component = ImageBasedLight {
+            cubemap: "assets/textures/irradiance_map.exr".to_string(),
+            ..Default::default()
+        };
+
+        let env_light_id = world.add_entity();
+        world.add_component(env_light_id, env_light_component);
+
+        // Register camera and systems
         let mesh_rendering_system = MeshRenderingSystem::new(self.gfx_api.clone().unwrap());
         let material_rendering_system = MaterialRenderingSystem::new(self.gfx_api.clone().unwrap());
+        let light_rendering_system = LightRenderingSystem::new(self.gfx_api.clone().unwrap());
 
         let mesh_rotator_system = MeshRotatorSystem::default();
         let camera_rendering_system = CameraRenderingSystem::new(
@@ -100,6 +114,7 @@ impl App
 
         world.register_system(mesh_rendering_system);
         world.register_system(material_rendering_system);
+        world.register_system(light_rendering_system);
         world.register_system(mesh_rotator_system);
         world.register_system(camera_rendering_system);
 

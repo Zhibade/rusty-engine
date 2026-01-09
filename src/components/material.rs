@@ -41,6 +41,7 @@ pub struct Material
     pub vertex_shader_path: String,
     pub fragment_shader_path: String,
     pub textures: Vec<Texture>,
+    pub is_lit: bool,
 
     pub has_been_initialized: bool,
 }
