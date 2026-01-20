@@ -1,6 +1,6 @@
 //! Graphics API that will be used to render onto the application's window
 
-use crate::components::material::{Texture, TextureUsage};
+use crate::components::material::{LightingMode, PbrParameters, Texture, TextureUsage};
 use crate::components::mesh::Mesh;
 use crate::loaders::image_loader::{ImageData, PixelData};
 use std::cmp;
@@ -75,21 +75,31 @@ use winit::window::Window;
 // Constants
 const VIEW_PROJ_DESCRIPTOR_SET_LAYOUT_INDEX: usize = 0;
 const TEXTURES_DESCRIPTOR_SET_LAYOUT_INDEX: usize = 1;
+const LIGHTING_DESCRIPTOR_SET_LAYOUT_INDEX: usize = 2;
+const PBR_PARAMS_DESCRIPTOR_SET_LAYOUT_INDEX: usize = 3;
 
 const CUBEMAP_CONVERSION_SHADER_PATH: &str = "src/graphics/shaders/cubemap_conversion_comp.spv";
 const FALLBACK_PIPELINE_NAME: &str = "Fallback";
 const FALLBACK_VERTEX_SHADER_PATH: &str = "src/graphics/shaders/base_vert.spv";
 const FALLBACK_FRAGMENT_SHADER_PATH: &str = "src/graphics/shaders/fallback_frag.spv";
 
-const DEFAULT_BLACK_TEXTURE_PATH: &str = "default-black";
-
 /// Shader/material pipeline and texture assignments data
 struct PipelineData
 {
     graphics_pipeline: Arc<GraphicsPipeline>,
-    uses_lighting: bool,
+    lighting_mode: LightingMode,
+    pbr_parameters_data: Option<PbrParametersData>,
     texture_assignments: HashMap<TextureUsage, String>,
     textures_descriptor_set: Option<Arc<DescriptorSet>>,
+}
+
+/// PBR parameters data after uploading to the GPU
+struct PbrParametersData
+{
+    pbr_parameters: PbrParametersBufferData,
+    pbr_parameters_buffer: Subbuffer<PbrParametersBufferData>,
+    pbr_parameters_descriptor_set: Arc<DescriptorSet>,
+    updated_parameters: bool,
 }
 
 /// Render mesh data after uploading to the GPU
@@ -160,6 +170,32 @@ struct EnvironmentMapData
     angle: f32,
 }
 
+/// PBR parameters buffer contents
+#[derive(BufferContents, Clone)]
+#[repr(C)]
+struct PbrParametersBufferData
+{
+    color_tint: [f32; 4],
+    occlusion_strength: f32,
+    roughness_strength: f32,
+    metallic_strength: f32,
+    normal_strength: f32,
+}
+
+impl Default for PbrParametersBufferData
+{
+    fn default() -> Self
+    {
+        PbrParametersBufferData {
+            color_tint: [1.0, 1.0, 1.0, 1.0],
+            occlusion_strength: 1.0,
+            roughness_strength: 1.0,
+            metallic_strength: 1.0,
+            normal_strength: 1.0,
+        }
+    }
+}
+
 /// Graphics API interface
 /// Only Vulkan is supported at the moment
 pub struct GfxApi
@@ -182,6 +218,9 @@ pub struct GfxApi
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
 
     // Shader data
+    render_meshes_data: HashMap<String, RenderMeshData>,
+    texture_data: HashMap<String, TextureData>,
+
     environment_map_data: EnvironmentMapData,
     environment_map_data_buffer: Subbuffer<EnvironmentMapData>,
     environment_map_texture_data: TextureData,
@@ -189,8 +228,6 @@ pub struct GfxApi
     updated_environment_map_data: bool,
     updated_environment_map_texture: bool,
 
-    render_meshes_data: HashMap<String, RenderMeshData>,
-    texture_data: HashMap<String, TextureData>,
     view_projection_data: ViewProjectionData, // Current camera (view-projection) data
     view_perspective_data_buffer: Subbuffer<ViewProjectionData>,
     view_perspective_data_descriptor_set: Arc<DescriptorSet>,
@@ -365,7 +402,7 @@ impl GfxApi
             vert_shader_entry_point,
             frag_shader_entry_point,
             0,
-            false,
+            LightingMode::Unlit,
         );
 
         // Create cubemap conversion compute pipeline
@@ -443,30 +480,14 @@ impl GfxApi
         )
         .unwrap();
 
-        // Allocate placeholder texture data
-        let default_image_data = ImageData::default_black();
-        let default_texture = Texture {
-            filepath: String::from(DEFAULT_BLACK_TEXTURE_PATH),
-            is_rgb: true,
-            is_cubemap: false,
-            usage: TextureUsage::Albedo,
-        };
-
-        let default_texture_data_map = Self::allocate_texture_samplers(
-            memory_allocator.clone(),
-            command_buffer_allocator.clone(),
-            device.clone(),
-            graphics_queue.clone(),
-            Vec::from([(default_image_data, &default_texture)]),
-        );
-
         // Register fallback pipeline data
         let mut pipeline_data = HashMap::new();
         pipeline_data.insert(
             FALLBACK_PIPELINE_NAME.to_string(),
             PipelineData {
                 graphics_pipeline: fallback_graphics_pipeline,
-                uses_lighting: false,
+                lighting_mode: LightingMode::Unlit,
+                pbr_parameters_data: None,
                 texture_assignments: HashMap::new(),
                 textures_descriptor_set: None,
             },
@@ -499,7 +520,7 @@ impl GfxApi
             updated_environment_map_texture: false,
 
             render_meshes_data: HashMap::new(),
-            texture_data: default_texture_data_map,
+            texture_data: HashMap::new(),
             view_projection_data,
             view_perspective_data_buffer,
             view_perspective_data_descriptor_set,
@@ -795,7 +816,6 @@ impl GfxApi
     {
         let texture_info = Texture {
             filepath: String::from("environment_map"),
-            is_rgb: true,
             is_cubemap: true,
             ..Texture::default()
         };
@@ -1260,7 +1280,7 @@ impl GfxApi
         vert_shader_entry_point: EntryPoint,
         frag_shader_entry_point: EntryPoint,
         texture_count: u32,
-        uses_lighting: bool,
+        lighting_mode: LightingMode,
     ) -> Arc<GraphicsPipeline>
     {
         let vertex_input_state =
@@ -1352,9 +1372,32 @@ impl GfxApi
         };
 
         // If using lighting, create environment map data descriptor set layout
-        if uses_lighting
+        if lighting_mode == LightingMode::Lit || lighting_mode == LightingMode::PBR
         {
             descriptor_set_layouts.push(Self::get_environment_map_data_layout(device.clone()));
+
+            // If PBR, add PBR parameters' descriptor set layout
+            if lighting_mode == LightingMode::PBR
+            {
+                let pbr_params_descriptor_set_layout_binding = DescriptorSetLayoutBinding {
+                    descriptor_count: 1,
+                    stages: ShaderStages::FRAGMENT,
+                    ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
+                };
+
+                let pbr_params_descriptor_set_layout_create_info = DescriptorSetLayoutCreateInfo {
+                    bindings: BTreeMap::from([(0, pbr_params_descriptor_set_layout_binding)]),
+                    ..DescriptorSetLayoutCreateInfo::default()
+                };
+
+                let pbr_params_descriptor_set_layout = DescriptorSetLayout::new(
+                    device.clone(),
+                    pbr_params_descriptor_set_layout_create_info,
+                )
+                .expect("Failed to create PBR parameters descriptor set layout");
+
+                descriptor_set_layouts.push(pbr_params_descriptor_set_layout);
+            }
         }
 
         let pipeline_layout_create_info = PipelineLayoutCreateInfo {
@@ -1438,6 +1481,44 @@ impl GfxApi
         }
 
         framebuffers
+    }
+
+    /// Create the textures' descriptors set for a given graphics pipeline using the
+    /// given texture assignments and texture data
+    fn create_textures_descriptor_set(
+        descriptor_set_allocator: Arc<dyn DescriptorSetAllocator>,
+        graphics_pipeline: Arc<GraphicsPipeline>,
+        material_name: &str,
+        texture_assignments: &HashMap<TextureUsage, String>,
+        texture_data: &HashMap<String, TextureData>,
+    ) -> Arc<DescriptorSet>
+    {
+        let mut texture_bindings = Vec::new();
+
+        for (texture_usage, filepath) in texture_assignments.iter()
+        {
+            let texture_data = texture_data.get(filepath).unwrap();
+
+            let write_descriptor_set = WriteDescriptorSet::image_view_sampler(
+                texture_usage.clone() as u32,
+                texture_data.image_view.clone(),
+                texture_data.sampler.clone(),
+            );
+
+            texture_bindings.push(write_descriptor_set);
+        }
+
+        let descriptor_set_layout = graphics_pipeline
+            .layout()
+            .set_layouts()
+            .get(TEXTURES_DESCRIPTOR_SET_LAYOUT_INDEX)
+            .unwrap()
+            .clone();
+
+        DescriptorSet::new(descriptor_set_allocator, descriptor_set_layout, texture_bindings, [])
+            .expect(
+                format!("Failed to create textures' descriptor set for {material_name}").as_str(),
+            )
     }
 
     /// Load a shader from the given path
@@ -1553,10 +1634,12 @@ impl GfxApi
     {
         match image_data.data
         {
-            PixelData::SDR(_) =>
+            PixelData::SDR(_) => match texture.usage
             {
-                if texture.is_rgb { Format::R8G8B8A8_SRGB } else { Format::R8G8B8A8_SNORM }
-            }
+                TextureUsage::Color => Format::R8G8B8A8_SRGB,
+                TextureUsage::OcclusionRoughnessMetallic => Format::R8G8B8A8_UNORM,
+                TextureUsage::Normal => Format::R8G8B8A8_SNORM,
+            },
 
             PixelData::HDR(_) => Format::R32G32B32A32_SFLOAT,
         }
@@ -1688,7 +1771,7 @@ impl GfxApi
         fragment_shader_path: &str,
         material_name: &String,
         texture_count: u32,
-        uses_lighting: bool,
+        lighting_mode: LightingMode,
     )
     {
         // Load shaders and initialize pipeline
@@ -1701,14 +1784,66 @@ impl GfxApi
             &self.render_pass,
             vert_shader_entry_point,
             frag_shader_entry_point,
-            texture_count, // Could maybe get this via fragment shader entry point?
-            uses_lighting,
+            texture_count,
+            lighting_mode,
         );
 
-        // Add/update pipeline data (textures data has to be updated with init_textures)
+        // If PBR, create default PBR parameters and upload them to the GPU
+        let pbr_parameters_data = match lighting_mode
+        {
+            LightingMode::PBR =>
+            {
+                let pbr_parameters = PbrParametersBufferData::default();
+                let pbr_parameters_buffer = Self::allocate_data_buffer(
+                    self.memory_allocator.clone(),
+                    pbr_parameters.clone(),
+                );
+
+                let pbr_parameters_descriptor_set_layout = graphics_pipeline
+                    .layout()
+                    .set_layouts()
+                    .get(PBR_PARAMS_DESCRIPTOR_SET_LAYOUT_INDEX)
+                    .expect(
+                        format!(
+                            "Failed to retrieve PBR parameters' descriptor set layout \
+                                        for {material_name}"
+                        )
+                        .as_str(),
+                    )
+                    .clone();
+
+                let pbr_parameters_descriptor_set = DescriptorSet::new(
+                    self.descriptor_set_allocator.clone(),
+                    pbr_parameters_descriptor_set_layout,
+                    [WriteDescriptorSet::buffer(0, pbr_parameters_buffer.clone())],
+                    [],
+                )
+                .expect(
+                    format!(
+                        "Failed to create PBR parameters' descriptor set \
+                                             for {material_name}"
+                    )
+                    .as_str(),
+                );
+
+                let pbr_parameters_data = PbrParametersData {
+                    pbr_parameters,
+                    pbr_parameters_buffer,
+                    pbr_parameters_descriptor_set,
+                    updated_parameters: false,
+                };
+
+                Some(pbr_parameters_data)
+            }
+
+            _ => None,
+        };
+
+        // Add/update pipeline data (actual textures' data has to be set with init_textures)
         let pipeline_data = PipelineData {
             graphics_pipeline,
-            uses_lighting,
+            lighting_mode,
+            pbr_parameters_data,
             texture_assignments: HashMap::new(),
             textures_descriptor_set: None,
         };
@@ -1749,7 +1884,7 @@ impl GfxApi
             {
                 #[cfg(debug_assertions)]
                 println!(
-                    "GfxApi :: init_texture :: Texture {} :: Texture is already initialized.\
+                    "GfxApi :: init_texture :: Texture {} :: Texture is already initialized. \
                     Skipping initialization.",
                     texture.filepath
                 );
@@ -1827,43 +1962,26 @@ impl GfxApi
         }
 
         // Update texture descriptor set
-        let texture_assignments =
-            &self.pipeline_data.get(material_name).unwrap().texture_assignments;
-        let mut texture_bindings = Vec::new();
-
-        for (texture_usage, filepath) in texture_assignments.iter()
-        {
-            let texture_data = self.texture_data.get(filepath).unwrap();
-
-            let write_descriptor_set = WriteDescriptorSet::image_view_sampler(
-                texture_usage.clone() as u32,
-                texture_data.image_view.clone(),
-                texture_data.sampler.clone(),
-            );
-
-            texture_bindings.push(write_descriptor_set);
-        }
-
-        let graphics_pipeline = &self
+        let graphics_pipeline = self
             .pipeline_data
             .get(material_name)
             .expect(format!("Failed to get graphics pipeline with name: {material_name}").as_str())
-            .graphics_pipeline;
-
-        let descriptor_set_layout = graphics_pipeline
-            .layout()
-            .set_layouts()
-            .get(TEXTURES_DESCRIPTOR_SET_LAYOUT_INDEX)
-            .unwrap()
+            .graphics_pipeline
             .clone();
 
-        let texture_descriptor_set = DescriptorSet::new(
+        let texture_assignments = &self
+            .pipeline_data
+            .get(material_name)
+            .expect(format!("Failed to get pipeline data for {material_name}").as_str())
+            .texture_assignments;
+
+        let texture_descriptor_set = Self::create_textures_descriptor_set(
             self.descriptor_set_allocator.clone(),
-            descriptor_set_layout,
-            texture_bindings,
-            [],
-        )
-        .unwrap();
+            graphics_pipeline,
+            material_name.as_str(),
+            texture_assignments,
+            &self.texture_data,
+        );
 
         self.pipeline_data.get_mut(material_name).unwrap().textures_descriptor_set =
             Some(texture_descriptor_set);
@@ -1942,9 +2060,19 @@ impl GfxApi
             }
 
             // Add lighting descriptor set if it uses lighting
-            if pipeline_data.uses_lighting
+            if pipeline_data.lighting_mode == LightingMode::Lit
+                || pipeline_data.lighting_mode == LightingMode::PBR
             {
                 descriptor_sets.push(self.environment_map_descriptor_set.clone());
+
+                // Add PBR parameters descriptor set if PBR
+                if pipeline_data.lighting_mode == LightingMode::PBR
+                {
+                    if let Some(ref pbr_parameter) = pipeline_data.pbr_parameters_data
+                    {
+                        descriptor_sets.push(pbr_parameter.pbr_parameters_descriptor_set.clone());
+                    }
+                }
             }
 
             let id = &mesh_data.pipeline_data_id;
@@ -1997,6 +2125,7 @@ impl GfxApi
         // Update necessary buffers before execution
         self.update_view_projection_buffer();
         self.update_lighting_buffers();
+        self.update_pbr_parameters_buffers();
 
         let swapchain_present_info =
             SwapchainPresentInfo::swapchain_image_index(self.swapchain.clone(), image_index);
@@ -2057,7 +2186,7 @@ impl GfxApi
 
     /// Update specific mesh's transform
     ///
-    /// Call will be ignored if mesh has not been initialized via `init_mesh`
+    /// Call will be ignored if mesh has not been initialized via [init_mesh](GfxApi::init_mesh)
     pub fn update_mesh_transform(&mut self, filepath: &String, new_matrix: [[f32; 4]; 4])
     {
         if self.render_meshes_data.contains_key(filepath)
@@ -2072,6 +2201,51 @@ impl GfxApi
             );
 
             Self::log_error(err_msg.as_str());
+        }
+    }
+    /// Update PBR parameters for a specific material/pipeline\
+    /// Call will be ignored if material does not exist
+    pub fn update_pbr_parameters(&mut self, material_name: &String, pbr_parameters: &PbrParameters)
+    {
+        if !self.pipeline_data.contains_key(material_name)
+        {
+            let err_msg = format!(
+                "update_pbr_parameters :: Material: {material_name} ::\
+                Material has not been initialized. Ignoring call."
+            );
+
+            Self::log_error(err_msg.as_str());
+
+            return;
+        }
+
+        let pbr_parameters_data =
+            self.pipeline_data.get_mut(material_name).unwrap().pbr_parameters_data.as_mut();
+
+        // Update data if it exists
+        // Otherwise log an error since shaders were not initialized as PBR
+        match pbr_parameters_data
+        {
+            Some(data) =>
+            {
+                data.pbr_parameters.color_tint = pbr_parameters.color_tint;
+                data.pbr_parameters.occlusion_strength = pbr_parameters.occlusion_strength;
+                data.pbr_parameters.roughness_strength = pbr_parameters.roughness_strength;
+                data.pbr_parameters.metallic_strength = pbr_parameters.metallic_strength;
+                data.pbr_parameters.normal_strength = pbr_parameters.normal_strength;
+
+                data.updated_parameters = true;
+            }
+
+            None =>
+            {
+                let err_msg = format!(
+                    "update_pbr_parameters :: Material: {material_name} ::\
+                        Material was not initialized as PBR. Ignoring call."
+                );
+
+                Self::log_error(err_msg.as_str());
+            }
         }
     }
 
@@ -2113,6 +2287,60 @@ impl GfxApi
         // Reset update flags
         self.updated_environment_map_data = false;
         self.updated_environment_map_texture = false;
+    }
+
+    /// Update PBR parameters buffer data for all materials if there were any changes
+    /// # Panics
+    /// Will panic if this is called while the GPU is using the uniform buffer\
+    /// Need to wait until the previous frame is finished processing before calling this function
+    fn update_pbr_parameters_buffers(&mut self)
+    {
+        for (material_name, pipeline_data) in self.pipeline_data.iter_mut()
+        {
+            if let Some(ref mut pbr_parameters_data) = pipeline_data.pbr_parameters_data
+            {
+                // Only update buffers that were actually changed
+                if pbr_parameters_data.updated_parameters
+                {
+                    let mut buffer_write =
+                        pbr_parameters_data.pbr_parameters_buffer.write().unwrap();
+                    *buffer_write = pbr_parameters_data.pbr_parameters.clone();
+
+                    let descriptor_set_layout = pipeline_data
+                        .graphics_pipeline
+                        .layout()
+                        .set_layouts()
+                        .get(PBR_PARAMS_DESCRIPTOR_SET_LAYOUT_INDEX)
+                        .expect(
+                            format!(
+                                "Failed to get PBR parameters descriptor set layout \
+                                         for {material_name}"
+                            )
+                            .as_str(),
+                        )
+                        .clone();
+
+                    pbr_parameters_data.pbr_parameters_descriptor_set = DescriptorSet::new(
+                        self.descriptor_set_allocator.clone(),
+                        descriptor_set_layout,
+                        [WriteDescriptorSet::buffer(
+                            0,
+                            pbr_parameters_data.pbr_parameters_buffer.clone(),
+                        )],
+                        [],
+                    )
+                    .expect(
+                        format!(
+                            "Failed to create new PBR parameters \
+                                     descriptor set for {material_name}"
+                        )
+                        .as_str(),
+                    );
+
+                    pbr_parameters_data.updated_parameters = false;
+                }
+            }
+        }
     }
 
     /// Update view-projection buffer data from latest camera update

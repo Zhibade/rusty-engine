@@ -219,7 +219,7 @@ impl World
 
     /// Register a new system type in the world
     ///
-    /// System's update method will be run every frame
+    /// [System]'s [update](System::update) method will be run every frame
     ///
     /// Each system type can only be registered once. Call will be ignored if trying to register
     /// an already registered type
@@ -243,7 +243,7 @@ impl World
 
     /// Update the world for this frame
     ///
-    /// All registered systems will run their `update` method
+    /// All registered [System]s will run their [update](System::update) method
     pub fn update(&mut self)
     {
         let delta_time = (Instant::now() - self.last_frame_time).as_secs_f32();

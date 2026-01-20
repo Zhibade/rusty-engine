@@ -13,6 +13,8 @@ layout(location = 0) out vec4 f_color;
 
 // Texture samplers
 layout(set = 1, binding = 0) uniform sampler2D albedoTex;
+layout(set = 1, binding = 1) uniform sampler2D ormTex; // Occlusion-Roughness-Metallic
+layout(set = 1, binding = 2) uniform sampler2D normalTex;
 
 // Lighting settings + environment/irradiance map sampler
 layout(set = 2, binding = 0) uniform EnvironmentMapData
@@ -22,6 +24,16 @@ layout(set = 2, binding = 0) uniform EnvironmentMapData
 } lighting_settings;
 
 layout(set = 2, binding = 1) uniform samplerCube irradianceMap;
+
+// PBR parameters
+layout(set = 3, binding = 0) uniform PbrParameters
+{
+    vec4 color_tint;
+    float occlusion_strength;
+    float roughness_strength;
+    float metallic_strength;
+    float normal_strength;
+} pbr_parameters;
 
 // Rotate direction vector in Y axis
 vec3 rotateY(vec3 vector, float angle)

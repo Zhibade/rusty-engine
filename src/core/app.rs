@@ -2,7 +2,7 @@
 
 use crate::components::camera::Camera;
 use crate::components::image_based_light::ImageBasedLight;
-use crate::components::material::{Material, Texture, TextureUsage};
+use crate::components::material::{LightingMode, Material, Texture, TextureUsage};
 use crate::components::transform::Transform;
 use crate::core::world::World;
 use crate::graphics::gfx_api::GfxApi;
@@ -49,18 +49,17 @@ impl App
 
         let mesh_color_tex = Texture {
             filepath: String::from("assets/textures/uv_checker.png"),
-            is_rgb: true,
             is_cubemap: false,
-            usage: TextureUsage::Albedo,
+            usage: TextureUsage::Color,
         };
+
+        let mesh_normal_tex = Texture::default_normal();
+        let mesh_orm_tex = Texture::default_orm();
 
         let mesh_material = Material {
             name: "Object".to_string(),
-            vertex_shader_path: "src/graphics/shaders/base_vert.spv".to_string(),
-            fragment_shader_path: "src/graphics/shaders/base_frag.spv".to_string(),
-            textures: vec![mesh_color_tex],
-            is_lit: true,
-            has_been_initialized: false,
+            textures: vec![mesh_color_tex, mesh_normal_tex, mesh_orm_tex],
+            ..Material::default_pbr()
         };
 
         let mesh_id = world.add_entity();
@@ -73,18 +72,17 @@ impl App
 
         let skybox_tex = Texture {
             filepath: "assets/textures/skybox.exr".to_string(),
-            is_rgb: true,
             is_cubemap: true,
-            usage: TextureUsage::Albedo,
+            usage: TextureUsage::Color,
         };
 
         let skybox_material = Material {
             name: "Skybox".to_string(),
             vertex_shader_path: "src/graphics/shaders/skybox_vert.spv".to_string(),
             fragment_shader_path: "src/graphics/shaders/skybox_frag.spv".to_string(),
+            lighting_mode: LightingMode::Unlit,
             textures: vec![skybox_tex],
-            is_lit: false,
-            has_been_initialized: false,
+            ..Material::default()
         };
 
         let skybox_id = world.add_entity();

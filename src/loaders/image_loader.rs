@@ -29,25 +29,35 @@ pub struct ImageData
 
 impl ImageData
 {
-    /// Create a 2x2 white SDR image data
+    /// Create a 1x1 white SDR image data
     pub fn default_white() -> Self
     {
         ImageData { data: PixelData::SDR(Vec::from([255; 4])), size: [1, 1], ..Self::default() }
     }
 
-    /// Create 2x2 black SDR image data
+    /// Create 1x1 black SDR image data
     pub fn default_black() -> Self
     {
         ImageData { data: PixelData::SDR(Vec::from([0; 4])), size: [1, 1], ..Self::default() }
     }
 
-    /// Create a 2x2 white HDR image data
+    /// Create 1x1 neutral normal image data
+    pub fn default_normal() -> Self
+    {
+        ImageData {
+            data: PixelData::SDR(Vec::from([128, 128, 255, 255])),
+            size: [1, 1],
+            ..Self::default()
+        }
+    }
+
+    /// Create a 1x1 white HDR image data
     pub fn default_white_hdr() -> Self
     {
         ImageData { data: PixelData::HDR(Vec::from([1.0; 4])), size: [1, 1], ..Self::default() }
     }
 
-    /// Create a 2x2 black HDR image data
+    /// Create a 1x1 black HDR image data
     pub fn default_black_hdr() -> Self
     {
         ImageData { data: PixelData::HDR(Vec::from([0.0; 4])), size: [1, 1], ..Self::default() }
@@ -123,7 +133,7 @@ pub fn load_image(filepath: impl AsRef<Path>) -> ImageData
     else
     {
         let message = format!(
-            "Could not retrieve extension for image file: {path_str}.\
+            "Could not retrieve extension for image file: {path_str}. \
             Using placeholder image"
         );
         log_error(message.as_str());
