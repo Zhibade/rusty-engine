@@ -1,0 +1,74 @@
+#version 450
+#include "math.glsl"
+
+#define PI 3.1415926535897932384626433832795
+#define MAX_CONTRIBUTION 10
+
+// ------
+// Samplers
+// ------
+
+// When multiplied, it is recommended that the total value is in the range 128 - 512 for better occupancy
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// Input equirectangular image
+layout(binding = 0) uniform samplerCube inputImage;
+
+// Output irradiance map (equirectangular)
+layout(binding = 1) uniform writeonly image2D outputIrradianceMap;
+
+// ------
+// Main
+// ------
+
+void main()
+{
+	ivec2 outputImageSize = imageSize(outputIrradianceMap).xy;
+	vec2 currentUv = (gl_GlobalInvocationID.xy + 0.5) / outputImageSize;
+
+	vec4 irradiance = vec4(0);
+	float totalSamples = 0;
+
+	// Convert from equirectangular UV to spherical coordinates
+	float currentTheta = currentUv.x * 2 * PI;
+	float currentPhi = currentUv.y * PI;
+
+	// Get current pixel's direction/normal vector, right vector and up vector
+	vec3 direction = getDirectionVectorFromSphereCoords(currentTheta, currentPhi);
+	vec3 right = normalize(cross(vec3(0, 1, 0), direction)); // Get right vector from a hard-coded tangent up vector
+	vec3 up = normalize(cross(direction, right)); // Get actual up vector from the other two
+
+	// Approximate integral by averaging samples across the hemisphere of the corresponding pixel in the cubemap
+	//
+	// Calculation is done in the tangent space of the current pixel's direction vector and then transformed to
+	// the actual cubemap space, this is so that the calculation is simplified and don't need to be calculating
+	// the theta and phi ranges per pixel and so on
+
+	const float angleIncrement = 0.025; // The smaller it is the better but increases calculation time (GPU could time out)
+
+	// Theta = Azimuth angle (full 360 degrees)
+	// Phi = Zenith angle (90 degrees since it is a hemisphere)
+	for (float theta = 0; theta < 2 * PI; theta += angleIncrement)
+	{
+		for (float phi = 0; phi < 0.5 * PI; phi += angleIncrement)
+		{
+			// Since renderer uses Y+ as the up axis, Y+ in tangent space should match the direction vector
+			vec3 tangentDirection = getDirectionVectorFromSphereCoords(theta, phi);
+			vec3 sampleDirection = tangentDirection.x * right + tangentDirection.y * direction + tangentDirection.z * up;
+
+			vec4 color = texture(inputImage, sampleDirection);
+
+			// Some HDR textures have extremely bright values that can cause artifacts on the irradiance map
+			// It is better to clamp the HDR values, just in case
+			color = normalize(color) * min(length(color), MAX_CONTRIBUTION);
+
+			// cos(phi): The larger the angle is, the less it contributes
+			// sin(phi): Increases contribution of samples near the up axis (since the sample area gets smaller)
+			irradiance += color * cos(phi) * sin(phi);
+			totalSamples++;
+		}
+	}
+
+	irradiance = PI * irradiance * (1 / float(totalSamples));
+	imageStore(outputIrradianceMap, ivec2(gl_GlobalInvocationID.xy), irradiance);
+}

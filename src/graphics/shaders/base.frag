@@ -2,6 +2,7 @@
 
 #version 450
 #include "lighting.glsl"
+#include "math.glsl"
 
 // Input fragment data (coming from vertex shader)
 layout(location = 0) in vec3 v_color;

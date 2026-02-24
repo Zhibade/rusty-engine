@@ -90,9 +90,9 @@ impl App
         world.add_component(skybox_id, skybox_material);
         world.add_component(skybox_id, Transform::from_scale(Vec3::new(99.0, 99.0, 99.0)));
 
-        // Add environment lighting (uses precomputed irradiance cubemap for now)
+        // Add environment lighting
         let env_light_component = ImageBasedLight {
-            cubemap: "assets/textures/irradiance_map.exr".to_string(),
+            cubemap: "assets/textures/skybox.exr".to_string(),
             ..Default::default()
         };
 

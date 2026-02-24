@@ -1,4 +1,4 @@
-// Include file with lighting data and function declarations
+// Include file with lighting data
 
 // ------
 // Constants
@@ -28,19 +28,3 @@ layout(set = 3, binding = 0) uniform PbrParameters
     float metallic_strength;
     float normal_strength;
 } pbr_parameters;
-
-// ------
-// Functions
-// ------
-
-// Rotate direction vector in Y axis
-vec3 rotateY(vec3 vector, float angle)
-{
-    float angleRad = radians(angle);
-    mat4 rotMatrix = mat4(cos(angleRad), 0, sin(angleRad), 0,
-    0, 1, 0, 0,
-    -sin(angleRad), 0, cos(angleRad), 0,
-    0, 0, 0, 1);
-
-    return (rotMatrix * vec4(vector, 0)).xyz;
-}
