@@ -37,8 +37,8 @@ use vulkano::image::sampler::{
 };
 use vulkano::image::view::{ImageView, ImageViewCreateInfo, ImageViewType};
 use vulkano::image::{
-    Image, ImageCreateFlags, ImageCreateInfo, ImageLayout, ImageSubresourceLayers, ImageTiling,
-    ImageType, ImageUsage,
+    Image, ImageCreateFlags, ImageCreateInfo, ImageLayout, ImageSubresourceLayers,
+    ImageSubresourceRange, ImageTiling, ImageType, ImageUsage,
 };
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions};
 use vulkano::library::VulkanLibrary;
@@ -85,20 +85,48 @@ const CUBEMAP_CONVERSION_SHADER_PATH: &str = "src/graphics/shaders/cubemap_conve
 const IRRADIANCE_MAP_SUFFIX: &str = "irradiance-map";
 const IRRADIANCE_MAP_CONVOLUTION_SHADER_PATH: &str =
     "src/graphics/shaders/irradiance_map_convolution_comp.spv";
+const PREFILTERED_MAP_SUFFIX: &str = "prefiltered-map";
+const PREFILTERED_MAP_CONVOLUTION_SHADER_PATH: &str =
+    "src/graphics/shaders/prefiltered_map_convolution_comp.spv";
 
 const FALLBACK_PIPELINE_NAME: &str = "Fallback";
 const FALLBACK_VERTEX_SHADER_PATH: &str = "src/graphics/shaders/base_vert.spv";
 const FALLBACK_FRAGMENT_SHADER_PATH: &str = "src/graphics/shaders/fallback_frag.spv";
 
 // ------
+// Internal enums
+// ------
+
+/// Method used when dispatching a compute shader
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ComputeDispatchMethod
+{
+    Once,
+    OncePerMipmap,
+    OncePerMipmapAlwaysUseFirstMipmapAsInput,
+}
+
+// ------
 // Internal structs
 // ------
+
+/// Cubemap processing compute pipeline data
+#[derive(Debug)]
+struct CubemapComputePipelineData
+{
+    pipeline: Arc<ComputePipeline>,
+    max_mipmap_num: u32, // Maximum number of mipmaps that will be output from the shader
+
+    // Whether the shader uses image and mipmap metadata push constants
+    uses_metadata_constants: bool,
+}
 
 /// Environment texture data needed for PBR image-based lighting
 struct EnvironmentTextureData
 {
     environment_map: TextureData,
     irradiance_map: TextureData,
+    prefiltered_map: TextureData,
 }
 
 /// Shader/material pipeline and texture assignments data
@@ -184,6 +212,16 @@ struct ViewProjectionData
     perspective_matrix: [[f32; 4]; 4],
 }
 
+/// Metadata constants used in environment map processing compute shaders
+#[derive(BufferContents)]
+#[repr(C)]
+struct EnvironmentMapComputeConstants
+{
+    input_image_size: [u32; 2],
+    current_mipmap: u32,
+    total_mipmap_num: u32,
+}
+
 /// Image-based lighting data
 #[derive(BufferContents, Clone)]
 #[repr(C)]
@@ -235,8 +273,9 @@ pub struct GfxApi
     viewport: Viewport,
     render_pass: Arc<RenderPass>,
     pipeline_data: HashMap<String, PipelineData>, // Unique name -> Pipeline data
-    cubemap_conversion_pipeline: Arc<ComputePipeline>,
-    irradiance_map_pipeline: Arc<ComputePipeline>,
+    cubemap_conversion_pipeline_data: CubemapComputePipelineData,
+    irradiance_map_pipeline_data: CubemapComputePipelineData,
+    prefiltered_map_pipeline_data: CubemapComputePipelineData,
     framebuffers: Vec<Arc<Framebuffer>>,
     depth_stencil_format: Format,
 
@@ -434,13 +473,20 @@ impl GfxApi
         );
 
         // Create cubemap conversion compute pipeline
-        let [cubemap_conversion_pipeline, irradiance_map_pipeline] =
-            Self::create_cubemap_processing_pipelines(
-                &device,
-                vec![CUBEMAP_CONVERSION_SHADER_PATH, IRRADIANCE_MAP_CONVOLUTION_SHADER_PATH],
-            )
-            .try_into()
-            .expect("Failed to unpack cubemap compute pipelines vector");
+        let [
+            cubemap_conversion_pipeline_data,
+            irradiance_map_pipeline_data,
+            prefiltered_map_pipeline_data,
+        ] = Self::create_cubemap_processing_pipelines(
+            &device,
+            vec![
+                (CUBEMAP_CONVERSION_SHADER_PATH, 1, false),
+                (IRRADIANCE_MAP_CONVOLUTION_SHADER_PATH, 1, false),
+                (PREFILTERED_MAP_CONVOLUTION_SHADER_PATH, 1, true),
+            ],
+        )
+        .try_into()
+        .expect("Failed to unpack cubemap compute pipelines vector");
 
         // Create memory allocators
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
@@ -475,8 +521,9 @@ impl GfxApi
             device.clone(),
             graphics_queue.clone(),
             compute_queue.clone(),
-            cubemap_conversion_pipeline.clone(),
-            irradiance_map_pipeline.clone(),
+            &cubemap_conversion_pipeline_data,
+            &irradiance_map_pipeline_data,
+            &prefiltered_map_pipeline_data,
             ImageData::default_black_hdr(),
         );
 
@@ -489,6 +536,11 @@ impl GfxApi
                     1,
                     environment_texture_data.irradiance_map.image_view.clone(),
                     environment_texture_data.irradiance_map.sampler.clone(),
+                ),
+                WriteDescriptorSet::image_view_sampler(
+                    2,
+                    environment_texture_data.prefiltered_map.image_view.clone(),
+                    environment_texture_data.prefiltered_map.sampler.clone(),
                 ),
             ],
             [],
@@ -537,8 +589,9 @@ impl GfxApi
             viewport,
             render_pass,
             pipeline_data,
-            cubemap_conversion_pipeline,
-            irradiance_map_pipeline,
+            cubemap_conversion_pipeline_data,
+            irradiance_map_pipeline_data,
+            prefiltered_map_pipeline_data,
             framebuffers,
             depth_stencil_format,
 
@@ -678,16 +731,17 @@ impl GfxApi
     /// Allocate cubemap textures and convert them from equirectangular projection to a cubemap
     /// texture layout so that they can be read correctly by Vulkan\
     ///
-    /// If `is_environment_map` is `true`, irradiance map will be generated along with
-    /// the regular cubemap texture
+    /// If `is_environment_map` is `true`, image-based lighting maps (irradiance and prefiltered)
+    /// will be generated along with the regular cubemap texture
     fn allocate_cubemap_samplers(
         memory_allocator: Arc<dyn MemoryAllocator>,
         command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
         descriptor_set_allocator: Arc<dyn DescriptorSetAllocator>,
         graphics_queue: Arc<Queue>,
         compute_queue: Arc<Queue>,
-        cubemap_conversion_pipeline: Arc<ComputePipeline>,
-        irradiance_map_pipeline: Arc<ComputePipeline>,
+        cubemap_conversion_pipeline_data: &CubemapComputePipelineData,
+        irradiance_map_pipeline_data: &CubemapComputePipelineData,
+        prefiltered_map_pipeline_data: &CubemapComputePipelineData,
         cubemap_texture_data: Vec<(&str, &TextureData)>,
         is_environment_map: bool,
     ) -> HashMap<String, TextureData>
@@ -717,9 +771,10 @@ impl GfxApi
             let cubemap_data = Self::register_cubemap_conversion_commands(
                 memory_allocator.clone(),
                 descriptor_set_allocator.clone(),
-                cubemap_conversion_pipeline.clone(),
+                cubemap_conversion_pipeline_data,
                 &mut compute_command_buffer_builder,
                 texture_data,
+                false,
                 path,
             );
 
@@ -728,7 +783,7 @@ impl GfxApi
                 &cubemap_data.image_view.image(),
             );
 
-            // If it is an environment map, generate an irradiance map as well
+            // If it is an environment map, generate an irradiance map and prefiltered map as well
             if is_environment_map
             {
                 // Irradiance map generation (equirectangular) -> convert to cubemap ->
@@ -737,18 +792,20 @@ impl GfxApi
                     Self::register_environment_map_compute_commands(
                         memory_allocator.clone(),
                         descriptor_set_allocator.clone(),
-                        irradiance_map_pipeline.clone(),
+                        irradiance_map_pipeline_data,
                         &mut compute_command_buffer_builder,
                         &cubemap_data,
+                        ComputeDispatchMethod::Once,
                         path,
                     );
 
                 let irradiance_map_data = Self::register_cubemap_conversion_commands(
                     memory_allocator.clone(),
                     descriptor_set_allocator.clone(),
-                    cubemap_conversion_pipeline.clone(),
+                    cubemap_conversion_pipeline_data,
                     &mut compute_command_buffer_builder,
                     &irradiance_equirectangular_map_data,
+                    false,
                     path,
                 );
 
@@ -759,6 +816,32 @@ impl GfxApi
 
                 let irradiance_map_path = format!("{path}_{IRRADIANCE_MAP_SUFFIX}").to_string();
                 new_cubemap_data.insert(irradiance_map_path, irradiance_map_data);
+
+                // Prefiltered map generation (equirectangular) ->
+                // cubemap conversion for each mipmap
+                let prefiltered_equirectangular_map_data =
+                    Self::register_environment_map_compute_commands(
+                        memory_allocator.clone(),
+                        descriptor_set_allocator.clone(),
+                        prefiltered_map_pipeline_data,
+                        &mut compute_command_buffer_builder,
+                        &cubemap_data,
+                        ComputeDispatchMethod::OncePerMipmapAlwaysUseFirstMipmapAsInput,
+                        path,
+                    );
+
+                let prefiltered_map_data = Self::register_cubemap_conversion_commands(
+                    memory_allocator.clone(),
+                    descriptor_set_allocator.clone(),
+                    cubemap_conversion_pipeline_data,
+                    &mut compute_command_buffer_builder,
+                    &prefiltered_equirectangular_map_data,
+                    true,
+                    path,
+                );
+
+                let prefiltered_map_path = format!("{path}_{PREFILTERED_MAP_SUFFIX}").to_string();
+                new_cubemap_data.insert(prefiltered_map_path, prefiltered_map_data);
             }
 
             new_cubemap_data.insert(String::from(path), cubemap_data);
@@ -790,7 +873,8 @@ impl GfxApi
     }
 
     /// Allocate environment map cubemap samplers\
-    /// Returned tuple contains the environment map and irradiance map [EnvironmentTextureData]
+    /// Returned tuple contains the environment map, irradiance map, and prefiltered map's
+    /// [EnvironmentTextureData]
     fn allocate_environment_map_samplers(
         memory_allocator: Arc<dyn MemoryAllocator>,
         command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
@@ -798,8 +882,9 @@ impl GfxApi
         device: Arc<Device>,
         graphics_queue: Arc<Queue>,
         compute_queue: Arc<Queue>,
-        cubemap_conversion_pipeline: Arc<ComputePipeline>,
-        irradiance_map_pipeline: Arc<ComputePipeline>,
+        cubemap_conversion_pipeline_data: &CubemapComputePipelineData,
+        irradiance_map_pipeline_data: &CubemapComputePipelineData,
+        prefiltered_map_pipeline_data: &CubemapComputePipelineData,
         image_data: ImageData,
     ) -> EnvironmentTextureData
     {
@@ -829,8 +914,9 @@ impl GfxApi
             descriptor_set_allocator.clone(),
             graphics_queue.clone(),
             compute_queue.clone(),
-            cubemap_conversion_pipeline.clone(),
-            irradiance_map_pipeline.clone(),
+            cubemap_conversion_pipeline_data,
+            irradiance_map_pipeline_data,
+            prefiltered_map_pipeline_data,
             vec![(texture_info.filepath.as_str(), texture_data)],
             true,
         );
@@ -843,9 +929,14 @@ impl GfxApi
             .get(format!("{}_{IRRADIANCE_MAP_SUFFIX}", &texture_info.filepath).as_str())
             .expect("Failed to retrieve irradiance map cubemap texture data");
 
+        let prefiltered_map_texture_data = allocated_cubemap_texture_data
+            .get(format!("{}_{PREFILTERED_MAP_SUFFIX}", &texture_info.filepath).as_str())
+            .expect("Failed to retrieve prefiltered map cubemap texture data");
+
         EnvironmentTextureData {
             environment_map: cubemap_texture_data.clone(),
             irradiance_map: irradiance_map_texture_data.clone(),
+            prefiltered_map: prefiltered_map_texture_data.clone(),
         }
     }
 
@@ -1025,15 +1116,22 @@ impl GfxApi
         new_texture_data
     }
 
-    /// Register equirectangular map to cubemap conversion compute commands\
+    /// Register equirectangular map to cubemap conversion compute commands
+    ///
+    /// If `process_all_mipmaps` is set to `true`, compute shader will be dispatched for each
+    /// mipmap level in the equirectangular texture (outputted cubemap will contain the same number
+    /// of mipmaps). If it is set to `false`, cubemap's [Image]'s number of mipmaps will be
+    /// calculated from its dimensions, but compute shader will only be dispatched for the first one
+    ///
     /// Output [TexturedData] is returned\
     /// `texture_path` is only used for logging errors
     fn register_cubemap_conversion_commands(
         memory_allocator: Arc<dyn MemoryAllocator>,
         descriptor_set_allocator: Arc<dyn DescriptorSetAllocator>,
-        cubemap_conversion_pipeline: Arc<ComputePipeline>,
+        cubemap_conversion_pipeline_data: &CubemapComputePipelineData,
         compute_command_buffer_builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         equirectangular_map_texture_data: &TextureData,
+        process_all_mipmaps: bool,
         texture_path: &str,
     ) -> TextureData
     {
@@ -1042,14 +1140,25 @@ impl GfxApi
         let face_size =
             (equirectangular_map_texture_data.image_view.image().extent()[0] / 4).max(1);
 
-        let mipmap_num = if face_size < 2 { 1 } else { face_size.ilog2() };
+        let mipmap_num = {
+            let max_mipmaps = if face_size < 2 { 1 } else { face_size.ilog2() };
+
+            if process_all_mipmaps
+            {
+                equirectangular_map_texture_data.image_view.image().mip_levels().min(max_mipmaps)
+            }
+            else
+            {
+                max_mipmaps
+            }
+        };
 
         // Using STORAGE usage since it is going to be generated in the compute shader
         let mut image_usage = ImageUsage::SAMPLED | ImageUsage::STORAGE;
 
-        if mipmap_num > 1
+        if mipmap_num > 1 && !process_all_mipmaps
         {
-            // Only set as transfer source and destination when generating mipmaps
+            // Only set as transfer source and destination when generating mipmaps via graphics blit
             image_usage = image_usage | ImageUsage::TRANSFER_SRC | ImageUsage::TRANSFER_DST;
         }
 
@@ -1073,64 +1182,75 @@ impl GfxApi
         )
         .expect(format!("Failed to create target cubemap image for {texture_path}").as_str());
 
-        // Create image view for compute shader
-        // Cubemaps are an array of 6 images (one per cube face), so it needs to be Dim2dArray
-        // (processing each face separately)
-        let image_view_create_info = ImageViewCreateInfo {
-            view_type: ImageViewType::Dim2dArray,
-            ..ImageViewCreateInfo::from_image(&image)
-        };
+        let num_of_dispatches = if process_all_mipmaps { mipmap_num } else { 1 };
+        for i in 0..num_of_dispatches
+        {
+            // Create image view for compute shader
+            // Cubemaps are an array of 6 images (one per cube face), so it needs to be Dim2dArray
+            // (processing each face separately)
+            let image_view_create_info = ImageViewCreateInfo {
+                view_type: ImageViewType::Dim2dArray,
+                subresource_range: ImageSubresourceRange {
+                    mip_levels: i..i + 1, // Mipmap to process
+                    ..image.subresource_range()
+                },
+                ..ImageViewCreateInfo::from_image(&image)
+            };
 
-        let image_view = ImageView::new(image.clone(), image_view_create_info)
-            .expect(format!("Failed to create target image view for {texture_path}").as_str());
+            // Create descriptor sets
+            let input_image_view = {
+                let input_image = equirectangular_map_texture_data.image_view.image();
 
-        // Create descriptor sets
-        let input_write_descriptor_set = WriteDescriptorSet::image_view_sampler(
-            0,
-            equirectangular_map_texture_data.image_view.clone(),
-            equirectangular_map_texture_data.sampler.clone(),
-        );
+                if process_all_mipmaps
+                {
+                    let input_image_view_create_info = ImageViewCreateInfo {
+                        subresource_range: ImageSubresourceRange {
+                            mip_levels: i..i + 1,
+                            ..input_image.subresource_range()
+                        },
+                        ..ImageViewCreateInfo::from_image(input_image)
+                    };
 
-        let output_write_descriptor_set = WriteDescriptorSet::image_view(1, image_view.clone());
+                    ImageView::new(input_image.clone(), input_image_view_create_info)
+                        .expect(format!("Failed to create input image view for {texture_path}'s mipmap level {i}").as_str())
+                }
+                else
+                {
+                    equirectangular_map_texture_data.image_view.clone()
+                }
+            };
 
-        let descriptor_set = DescriptorSet::new(
-            descriptor_set_allocator.clone(),
-            cubemap_conversion_pipeline.layout().set_layouts()[0].clone(),
-            [input_write_descriptor_set, output_write_descriptor_set],
-            [],
-        )
-        .expect(
-            format!("Failed to create cubemap conversion's descriptor set for {texture_path}")
-                .as_str(),
-        );
-
-        // Register compute shader command
-        compute_command_buffer_builder
-            .bind_pipeline_compute(cubemap_conversion_pipeline.clone())
-            .expect(
-                format!("Failed to bind cubemap conversion compute pipeline for {texture_path}")
-                    .as_str(),
-            )
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                cubemap_conversion_pipeline.layout().clone(),
+            let input_write_descriptor_set = WriteDescriptorSet::image_view_sampler(
                 0,
-                descriptor_set,
+                input_image_view.clone(),
+                equirectangular_map_texture_data.sampler.clone(),
+            );
+
+            let output_image_view = ImageView::new(image.clone(), image_view_create_info)
+                .expect(format!("Failed to create target image view for {texture_path}").as_str());
+
+            let output_write_descriptor_set =
+                WriteDescriptorSet::image_view(1, output_image_view.clone());
+
+            let descriptor_set = DescriptorSet::new(
+                descriptor_set_allocator.clone(),
+                cubemap_conversion_pipeline_data.pipeline.layout().set_layouts()[0].clone(),
+                [input_write_descriptor_set, output_write_descriptor_set],
+                [],
             )
             .expect(
-                format!("Failed to bind cubemap conversion descriptor sets for {texture_path}")
+                format!("Failed to create cubemap conversion's descriptor set for {texture_path}")
                     .as_str(),
             );
 
-        unsafe {
-            compute_command_buffer_builder
-                .dispatch([face_size / 16, face_size / 16, 6]) // 16 x 16 threads x 6 faces
-                .expect(
-                    format!(
-                        "Failed to dispatch cubemap conversion compute shader for {texture_path}"
-                    )
-                    .as_str(),
-                );
+            // Register compute shader commands
+            Self::register_compute_dispatch_command(
+                compute_command_buffer_builder,
+                &cubemap_conversion_pipeline_data.pipeline,
+                descriptor_set,
+                [face_size / 16, face_size / 16, 6],
+                texture_path,
+            );
         }
 
         // Create actual cubemap image view and store it with current sampler so that it is
@@ -1149,25 +1269,97 @@ impl GfxApi
         }
     }
 
+    /// Register compute bind and dispatch commands\
+    /// `log_identifier` is only used for log messages
+    fn register_compute_dispatch_command(
+        compute_command_buffer_builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
+        compute_pipeline: &Arc<ComputePipeline>,
+        descriptor_set: Arc<DescriptorSet>,
+        dispatch_groups: [u32; 3],
+        log_identifier: &str,
+    )
+    {
+        compute_command_buffer_builder
+            .bind_pipeline_compute(compute_pipeline.clone())
+            .expect(format!("Failed to bind compute pipeline for {log_identifier}").as_str())
+            .bind_descriptor_sets(
+                PipelineBindPoint::Compute,
+                compute_pipeline.layout().clone(),
+                0,
+                descriptor_set,
+            )
+            .expect(
+                format!("Failed to bind compute descriptor sets for {log_identifier}").as_str(),
+            );
+
+        unsafe {
+            compute_command_buffer_builder
+                .dispatch(dispatch_groups)
+                .expect(format!("Failed to dispatch compute shader for {log_identifier}").as_str());
+        }
+    }
+
     /// Register commands for processing an environment cubemap in a compute shader\
+    ///
+    /// If `process_all_mipmaps` is set to `true`, compute shader will be dispatched for each
+    /// mipmap level in the equirectangular texture (outputted texture will contain the same number
+    /// of mipmaps). If it is set to `false`, output [Image]'s number of mipmaps will be
+    /// calculated from its dimensions and [CubemapComputePipelineData], but compute shader will
+    /// only be dispatched for the first one
+    ///
+    /// **NOTE:** If [CubemapComputePipelineData::max_mipmap_num] is higher than 1, this parameter
+    /// will be ignored since the shader is supposed to process all mipmaps at once
+    ///
     /// Output [TextureData] is returned\
     /// `texture_path` is only used for logging errors
     fn register_environment_map_compute_commands(
         memory_allocator: Arc<dyn MemoryAllocator>,
         descriptor_set_allocator: Arc<dyn DescriptorSetAllocator>,
-        compute_pipeline: Arc<ComputePipeline>,
+        compute_pipeline_data: &CubemapComputePipelineData,
         compute_command_buffer_builder: &mut AutoCommandBufferBuilder<PrimaryAutoCommandBuffer>,
         cubemap_texture_data: &TextureData,
+        dispatch_method: ComputeDispatchMethod,
         texture_path: &str,
     ) -> TextureData
     {
         let source_cubemap_image = cubemap_texture_data.image_view.image();
+        let dispatch_once_per_mipmap = match dispatch_method
+        {
+            ComputeDispatchMethod::OncePerMipmap => true,
+            ComputeDispatchMethod::OncePerMipmapAlwaysUseFirstMipmapAsInput => true,
+            _ => false,
+        };
 
         // Equirectangular image width is usually 4 times the face size. Height is usually half of
         // the width
-        let width = source_cubemap_image.extent()[0].max(1) * 4;
+        let source_cubemap_image_size =
+            [source_cubemap_image.extent()[0], source_cubemap_image.extent()[1]];
+
+        let width = source_cubemap_image_size[0].max(1) * 4;
         let height = width / 2;
         let extent = [width, height, 1];
+
+        let mip_levels = {
+            if dispatch_once_per_mipmap && compute_pipeline_data.max_mipmap_num == 1
+            {
+                cubemap_texture_data.image_view.image().mip_levels()
+            }
+            else
+            {
+                if width <= 4 || height < 2
+                {
+                    1
+                }
+                else
+                {
+                    // Final image is going to be a cubemap, so calculate the maximum mipmap level
+                    // based on the cubemap dimensions, not the equirectangular dimensions
+                    let larger_dimension = width.max(height);
+                    let dimensions_max_mipmap_num = (larger_dimension / 4).ilog2();
+                    compute_pipeline_data.max_mipmap_num.min(dimensions_max_mipmap_num)
+                }
+            }
+        };
 
         // Output image is equirectangular, not a cubemap. Cubemap conversion will be done later
         // via the cubemap conversion compute shader
@@ -1175,6 +1367,7 @@ impl GfxApi
             image_type: source_cubemap_image.image_type(),
             format: source_cubemap_image.format(),
             extent,
+            mip_levels,
             usage: ImageUsage::SAMPLED | ImageUsage::STORAGE,
             ..Default::default()
         };
@@ -1189,55 +1382,212 @@ impl GfxApi
         );
 
         let output_image_view_create_info = ImageViewCreateInfo::from_image(&output_image);
-        let output_image_view = ImageView::new(output_image, output_image_view_create_info).expect(
-            format!("Failed to create output environment map image view for {texture_path}")
-                .as_str(),
-        );
-
-        // Create descriptor sets
-        let input_write_descriptor_set = WriteDescriptorSet::image_view_sampler(
-            0,
-            cubemap_texture_data.image_view.clone(),
-            cubemap_texture_data.sampler.clone(),
-        );
-
-        let output_write_descriptor_set =
-            WriteDescriptorSet::image_view(1, output_image_view.clone());
-
-        let descriptor_set = DescriptorSet::new(
-            descriptor_set_allocator.clone(),
-            compute_pipeline.layout().set_layouts()[0].clone(),
-            [input_write_descriptor_set.clone(), output_write_descriptor_set],
-            [],
-        )
-        .expect(
-            format!("Failed to create output environment map descriptor set for {texture_path}")
-                .as_str(),
-        );
-
-        compute_command_buffer_builder
-            .bind_pipeline_compute(compute_pipeline.clone())
+        let output_image_view = ImageView::new(output_image.clone(), output_image_view_create_info)
             .expect(
-                format!("Failed to bind environment map compute pipeline for {texture_path}")
+                format!("Failed to create output environment map image view for {texture_path}")
                     .as_str(),
-            )
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                compute_pipeline.layout().clone(),
+            );
+
+        // Dispatch differs depending on whether all mipmaps are being processed, outputted or not
+        if dispatch_once_per_mipmap && compute_pipeline_data.max_mipmap_num == 1
+        {
+            for i in 0..mip_levels
+            {
+                let input_mipmap_image_view = {
+                    if dispatch_method
+                        == ComputeDispatchMethod::OncePerMipmapAlwaysUseFirstMipmapAsInput
+                    {
+                        // If only first mipmap is used as input, use input image view as is
+                        cubemap_texture_data.image_view.clone()
+                    }
+                    else
+                    {
+                        // When using each mipmap as each input, need to adjust the resource range
+                        // each time
+                        let input_image = cubemap_texture_data.image_view.image();
+
+                        let input_mipmap_image_view_create_info = ImageViewCreateInfo {
+                            view_type: ImageViewType::Cube,
+                            subresource_range: ImageSubresourceRange {
+                                mip_levels: i..i + 1,
+                                ..input_image.subresource_range()
+                            },
+                            ..ImageViewCreateInfo::from_image(input_image)
+                        };
+
+                        ImageView::new(
+                            input_image.clone(),
+                            input_mipmap_image_view_create_info,
+                        ).expect(
+                            format!("Failed to create input environment map image view for {texture_path} : mipmap {i}")
+                                .as_str(),
+                        )
+                    }
+                };
+
+                let output_mipmap_image_view_create_info = ImageViewCreateInfo {
+                    subresource_range: ImageSubresourceRange {
+                        mip_levels: i..i + 1,
+                        ..output_image.subresource_range()
+                    },
+                    ..ImageViewCreateInfo::from_image(&output_image)
+                };
+
+                let output_mipmap_image_view = ImageView::new(
+                    output_image.clone(),
+                    output_mipmap_image_view_create_info,
+                ).expect(
+                    format!("Failed to create output environment map image view for {texture_path} : mipmap {i}")
+                        .as_str(),
+                );
+
+                // Create descriptor sets
+                let input_write_descriptor_set = WriteDescriptorSet::image_view_sampler(
+                    0,
+                    input_mipmap_image_view,
+                    cubemap_texture_data.sampler.clone(),
+                );
+
+                let output_write_descriptor_set =
+                    WriteDescriptorSet::image_view(1, output_mipmap_image_view);
+
+                // Create descriptor set and register dispatch command
+                let descriptor_set = DescriptorSet::new(
+                    descriptor_set_allocator.clone(),
+                    compute_pipeline_data.pipeline.layout().set_layouts()[0].clone(),
+                    [input_write_descriptor_set.clone(), output_write_descriptor_set],
+                    [],
+                )
+                .expect(
+                    format!(
+                        "Failed to create output environment map descriptor set for {texture_path}"
+                    )
+                    .as_str(),
+                );
+
+                let mipmap_extent = [extent[0] / u32::pow(2, i), extent[1] / u32::pow(2, i)];
+                let dispatch_groups = [mipmap_extent[0] / 16, mipmap_extent[1] / 16];
+
+                // Register compute dispatch commands
+                if compute_pipeline_data.uses_metadata_constants
+                {
+                    let environment_map_compute_constants = EnvironmentMapComputeConstants {
+                        input_image_size: source_cubemap_image_size,
+                        current_mipmap: i,
+                        total_mipmap_num: mip_levels,
+                    };
+
+                    compute_command_buffer_builder
+                        .push_constants(
+                            compute_pipeline_data.pipeline.layout().clone(),
+                            0,
+                            environment_map_compute_constants,
+                        )
+                        .expect(
+                            format!("Failed to bind compute descriptor sets for {texture_path}")
+                                .as_str(),
+                        );
+                }
+
+                Self::register_compute_dispatch_command(
+                    compute_command_buffer_builder,
+                    &compute_pipeline_data.pipeline,
+                    descriptor_set,
+                    [dispatch_groups[0].max(1), dispatch_groups[1].max(1), 1],
+                    texture_path,
+                );
+            }
+        }
+        else
+        {
+            // When not dispatching once per mipmap, just need to set the output descriptor set
+            // to the number of mipmaps that will be outputted from the shader
+
+            // Create descriptor sets
+            let input_write_descriptor_set = WriteDescriptorSet::image_view_sampler(
                 0,
-                descriptor_set,
+                cubemap_texture_data.image_view.clone(),
+                cubemap_texture_data.sampler.clone(),
+            );
+
+            let output_write_descriptor_set = {
+                if compute_pipeline_data.max_mipmap_num == 1
+                {
+                    WriteDescriptorSet::image_view(1, output_image_view.clone())
+                }
+                else
+                {
+                    // If outputting multiple mipmaps, need to include each mipmap in the descriptor set
+                    let mut output_image_views = Vec::new();
+
+                    // Need to include the maximum number of descriptors in the compute shader
+                    // even if it is dummy data
+                    for i in 0..compute_pipeline_data.max_mipmap_num
+                    {
+                        // Only include up to the actual maximum mip level
+                        let mipmap_index = i.min(mip_levels - 1);
+
+                        let output_mipmap_image_view_create_info = ImageViewCreateInfo {
+                            subresource_range: ImageSubresourceRange {
+                                mip_levels: mipmap_index..mipmap_index + 1,
+                                ..output_image.subresource_range()
+                            },
+                            ..ImageViewCreateInfo::from_image(&output_image)
+                        };
+
+                        let output_mipmap_image_view = ImageView::new(output_image.clone(), output_mipmap_image_view_create_info).expect(
+                            format!("Failed to create output environment map image view for {texture_path}, mipmap {i}")
+                                .as_str(),
+                        );
+
+                        output_image_views.push(output_mipmap_image_view);
+                    }
+
+                    WriteDescriptorSet::image_view_array(1, 0, output_image_views)
+                }
+            };
+
+            // Create descriptor set and register dispatch command
+            let descriptor_set = DescriptorSet::new(
+                descriptor_set_allocator.clone(),
+                compute_pipeline_data.pipeline.layout().set_layouts()[0].clone(),
+                [input_write_descriptor_set.clone(), output_write_descriptor_set],
+                [],
             )
             .expect(
                 format!(
-                    "Failed to bind environment map compute descriptor sets for {texture_path}"
+                    "Failed to create output environment map descriptor set for {texture_path}"
                 )
                 .as_str(),
             );
 
-        unsafe {
-            compute_command_buffer_builder.dispatch([extent[0] / 16, extent[1] / 16, 1]).expect(
-                format!("Failed to dispatch environment map compute shader for {texture_path}")
-                    .as_str(),
+            // Register compute dispatch commands
+            if compute_pipeline_data.uses_metadata_constants
+            {
+                let environment_map_compute_constants = EnvironmentMapComputeConstants {
+                    input_image_size: source_cubemap_image_size,
+                    current_mipmap: 0,
+                    total_mipmap_num: mip_levels,
+                };
+
+                compute_command_buffer_builder
+                    .push_constants(
+                        compute_pipeline_data.pipeline.layout().clone(),
+                        0,
+                        environment_map_compute_constants,
+                    )
+                    .expect(
+                        format!("Failed to bind compute descriptor sets for {texture_path}")
+                            .as_str(),
+                    );
+            }
+
+            Self::register_compute_dispatch_command(
+                compute_command_buffer_builder,
+                &compute_pipeline_data.pipeline,
+                descriptor_set,
+                [extent[0] / 16, extent[1] / 16, mip_levels],
+                texture_path,
             );
         }
 
@@ -1437,17 +1787,23 @@ impl GfxApi
     }
 
     /// Create and initialize the cubemap processing compute pipelines for the given shaders\
+    ///
+    /// Each element in `pipeline_descriptions` is a tuple with the following:
+    /// - Shader path
+    /// - Number of mipmaps that will be output from that shader
+    /// - Whether the shader needs the image and mipmap metadata push constants or not
+    ///
     /// # Shader Requirements
     /// Shaders are expected to have a single input and output. Input is a combined image sampler;
     /// output is a storage image
     fn create_cubemap_processing_pipelines(
         device: &Arc<Device>,
-        shader_paths: Vec<impl AsRef<Path>>,
-    ) -> Vec<Arc<ComputePipeline>>
+        pipeline_descriptions: Vec<(impl AsRef<Path>, u32, bool)>,
+    ) -> Vec<CubemapComputePipelineData>
     {
         let mut pipelines = Vec::new();
 
-        for shader_path in shader_paths
+        for (shader_path, mipmap_num, uses_metadata_constants) in pipeline_descriptions
         {
             // Load shader and create shader stage create info
             let shader = Self::load_shader(device.clone(), shader_path);
@@ -1461,7 +1817,7 @@ impl GfxApi
             };
 
             let output_descriptor_set_layout_binding = DescriptorSetLayoutBinding {
-                descriptor_count: 1,
+                descriptor_count: mipmap_num,
                 stages: ShaderStages::COMPUTE,
                 ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::StorageImage)
             };
@@ -1478,9 +1834,27 @@ impl GfxApi
                 DescriptorSetLayout::new(device.clone(), descriptor_set_layout_create_info)
                     .expect("Failed to create cubemap compute input descriptor set layout");
 
+            let push_constant_range = {
+                if uses_metadata_constants
+                {
+                    let range = PushConstantRange {
+                        stages: ShaderStages::COMPUTE,
+                        offset: 0,
+                        size: size_of::<EnvironmentMapComputeConstants>() as u32,
+                    };
+
+                    Vec::from([range])
+                }
+                else
+                {
+                    Vec::new()
+                }
+            };
+
             // Create pipeline
             let pipeline_layout_create_info = PipelineLayoutCreateInfo {
                 set_layouts: vec![descriptor_set_layout],
+                push_constant_ranges: push_constant_range,
                 ..PipelineLayoutCreateInfo::default()
             };
 
@@ -1494,7 +1868,11 @@ impl GfxApi
             let pipeline = ComputePipeline::new(device.clone(), None, pipeline_create_info)
                 .expect("Failed to create cubemap compute pipeline");
 
-            pipelines.push(pipeline);
+            pipelines.push(CubemapComputePipelineData {
+                pipeline,
+                max_mipmap_num: mipmap_num,
+                uses_metadata_constants,
+            });
         }
 
         pipelines
@@ -1833,12 +2211,14 @@ impl GfxApi
     /// Get environment map data (buffer + image and sampler) descriptor set layout
     fn get_environment_map_data_layout(device: Arc<Device>) -> Arc<DescriptorSetLayout>
     {
+        // Lighting settings data
         let environment_map_data_binding = DescriptorSetLayoutBinding {
             descriptor_count: 1,
             stages: ShaderStages::FRAGMENT,
             ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
         };
 
+        // Irradiance map and prefiltered map bindings
         let environment_map_image_binding = DescriptorSetLayoutBinding {
             descriptor_count: 1,
             stages: ShaderStages::FRAGMENT,
@@ -1848,7 +2228,8 @@ impl GfxApi
         let environment_map_layout_info = DescriptorSetLayoutCreateInfo {
             bindings: BTreeMap::from([
                 (0, environment_map_data_binding),
-                (1, environment_map_image_binding),
+                (1, environment_map_image_binding.clone()), // Irradiance map
+                (2, environment_map_image_binding),         // Prefiltered map
             ]),
             ..DescriptorSetLayoutCreateInfo::default()
         };
@@ -1936,7 +2317,7 @@ impl GfxApi
     }
 
     /// Initializes the current environment map using the given [ImageData]\
-    /// If an environment map is already loaded, it will be replaced with the new one
+    /// If an environment map is already loaded it will be replaced with the new one
     pub fn init_environment_map(&mut self, image_data: ImageData)
     {
         let environment_texture_data = Self::allocate_environment_map_samplers(
@@ -1946,8 +2327,9 @@ impl GfxApi
             self.device.clone(),
             self.graphics_queue.clone(),
             self.compute_queue.clone(),
-            self.cubemap_conversion_pipeline.clone(),
-            self.irradiance_map_pipeline.clone(),
+            &self.cubemap_conversion_pipeline_data,
+            &self.irradiance_map_pipeline_data,
+            &self.prefiltered_map_pipeline_data,
             image_data,
         );
 
@@ -2181,8 +2563,9 @@ impl GfxApi
                 self.descriptor_set_allocator.clone(),
                 self.graphics_queue.clone(),
                 self.compute_queue.clone(),
-                self.cubemap_conversion_pipeline.clone(),
-                self.irradiance_map_pipeline.clone(),
+                &self.cubemap_conversion_pipeline_data,
+                &self.irradiance_map_pipeline_data,
+                &self.prefiltered_map_pipeline_data,
                 source_cubemap_data,
                 false,
             );
@@ -2508,6 +2891,11 @@ impl GfxApi
                     1,
                     self.environment_texture_data.irradiance_map.image_view.clone(),
                     self.environment_texture_data.irradiance_map.sampler.clone(),
+                ),
+                WriteDescriptorSet::image_view_sampler(
+                    2,
+                    self.environment_texture_data.prefiltered_map.image_view.clone(),
+                    self.environment_texture_data.prefiltered_map.sampler.clone(),
                 ),
             ],
             [],

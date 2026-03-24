@@ -1,12 +1,6 @@
 // Include file with lighting data
 
 // ------
-// Constants
-// ------
-
-#define PI 3.1415926535897932384626433832795
-
-// ------
 // Buffers and samplers
 // ------
 
@@ -18,6 +12,7 @@ layout(set = 2, binding = 0) uniform EnvironmentMapData
 } lighting_settings;
 
 layout(set = 2, binding = 1) uniform samplerCube irradianceMap;
+layout(set = 2, binding = 2) uniform samplerCube prefilteredMap;
 
 // PBR parameters
 layout(set = 3, binding = 0) uniform PbrParameters

@@ -1,6 +1,5 @@
 #version 450
-
-#define PI 3.1415926535897932384626433832795
+#include "math.glsl"
 
 // When multiplied, it is recommended that the total value is in the range 128 - 512 for better occupancy
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
