@@ -13,6 +13,7 @@ layout(set = 2, binding = 0) uniform EnvironmentMapData
 
 layout(set = 2, binding = 1) uniform samplerCube irradianceMap;
 layout(set = 2, binding = 2) uniform samplerCube prefilteredMap;
+layout(set = 2, binding = 3) uniform sampler2D brdfIntegrationMap;
 
 // PBR parameters
 layout(set = 3, binding = 0) uniform PbrParameters

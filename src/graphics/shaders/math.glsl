@@ -68,3 +68,25 @@ vec3 ggxSample(vec2 sequenceValue, vec3 normal, float roughness)
     vec3 sampleVec = tangent * coords.x + normal * coords.y + bitangent * coords.z;
     return normalize(sampleVec);
 }
+
+// Slick-GGX geometry self-shadowing approximation function for image-based lighting
+float geometrySchlickGGX(float NdotV, float roughness)
+{
+    float k = (roughness * roughness) / 2.0;
+
+    float nom   = NdotV;
+    float denom = NdotV * (1.0 - k) + k;
+
+    return nom / denom;
+}
+
+// Smith's geometry self-masking function
+float geometrySmith(vec3 normal, vec3 view, vec3 light, float roughness)
+{
+    float NdotV = max(dot(normal, view), 0.0);
+    float NdotL = max(dot(normal, light), 0.0);
+    float ggx2 = geometrySchlickGGX(NdotV, roughness);
+    float ggx1 = geometrySchlickGGX(NdotL, roughness);
+
+    return ggx1 * ggx2;
+}

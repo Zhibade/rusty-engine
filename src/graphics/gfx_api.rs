@@ -88,6 +88,7 @@ const IRRADIANCE_MAP_CONVOLUTION_SHADER_PATH: &str =
 const PREFILTERED_MAP_SUFFIX: &str = "prefiltered-map";
 const PREFILTERED_MAP_CONVOLUTION_SHADER_PATH: &str =
     "src/graphics/shaders/prefiltered_map_convolution_comp.spv";
+const BRDF_INTEGRATION_MAP_SHADER_PATH: &str = "src/graphics/shaders/brdf_integration_comp.spv";
 
 const FALLBACK_PIPELINE_NAME: &str = "Fallback";
 const FALLBACK_VERTEX_SHADER_PATH: &str = "src/graphics/shaders/base_vert.spv";
@@ -127,6 +128,7 @@ struct EnvironmentTextureData
     environment_map: TextureData,
     irradiance_map: TextureData,
     prefiltered_map: TextureData,
+    brdf_integration_map: TextureData,
 }
 
 /// Shader/material pipeline and texture assignments data
@@ -472,7 +474,7 @@ impl GfxApi
             LightingMode::Unlit,
         );
 
-        // Create cubemap conversion compute pipeline
+        // Create cubemap processing compute pipelines
         let [
             cubemap_conversion_pipeline_data,
             irradiance_map_pipeline_data,
@@ -514,18 +516,35 @@ impl GfxApi
         let environment_map_data_buffer =
             Self::allocate_data_buffer(memory_allocator.clone(), environment_map_data.clone());
 
-        let environment_texture_data = Self::allocate_environment_map_samplers(
+        let (env_map_texture_data, irradiance_map_texture_data, prefiltered_map_texture_data) =
+            Self::allocate_environment_map_samplers(
+                memory_allocator.clone(),
+                command_buffer_allocator.clone(),
+                descriptor_set_allocator.clone(),
+                device.clone(),
+                graphics_queue.clone(),
+                compute_queue.clone(),
+                &cubemap_conversion_pipeline_data,
+                &irradiance_map_pipeline_data,
+                &prefiltered_map_pipeline_data,
+                ImageData::default_black_hdr(),
+            );
+
+        // Pre-calculate BRDF integration map (only needs to be done once)
+        let brdf_integration_map_texture_data = Self::generate_brdf_integration_map(
             memory_allocator.clone(),
             command_buffer_allocator.clone(),
             descriptor_set_allocator.clone(),
-            device.clone(),
-            graphics_queue.clone(),
             compute_queue.clone(),
-            &cubemap_conversion_pipeline_data,
-            &irradiance_map_pipeline_data,
-            &prefiltered_map_pipeline_data,
-            ImageData::default_black_hdr(),
+            [512, 512],
         );
+
+        let environment_texture_data = EnvironmentTextureData {
+            environment_map: env_map_texture_data,
+            irradiance_map: irradiance_map_texture_data,
+            prefiltered_map: prefiltered_map_texture_data,
+            brdf_integration_map: brdf_integration_map_texture_data,
+        };
 
         let environment_map_descriptor_set = DescriptorSet::new(
             descriptor_set_allocator.clone(),
@@ -541,6 +560,11 @@ impl GfxApi
                     2,
                     environment_texture_data.prefiltered_map.image_view.clone(),
                     environment_texture_data.prefiltered_map.sampler.clone(),
+                ),
+                WriteDescriptorSet::image_view_sampler(
+                    3,
+                    environment_texture_data.brdf_integration_map.image_view.clone(),
+                    environment_texture_data.brdf_integration_map.sampler.clone(),
                 ),
             ],
             [],
@@ -748,13 +772,13 @@ impl GfxApi
     {
         let mut new_cubemap_data = HashMap::new();
 
-        // Create temporary command buffer for executing cubemap conversion shader
+        // Create temporary command buffer for executing cubemap processing shaders
         let mut compute_command_buffer_builder = AutoCommandBufferBuilder::primary(
             command_buffer_allocator.clone(),
             compute_queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         )
-        .expect("Failed to create compute command buffer for cubemap conversion");
+        .expect("Failed to create compute command buffer for cubemap compute processing");
 
         // Create temporary command buffer for generating mipmaps
         let mut graphics_command_buffer_builder = AutoCommandBufferBuilder::primary(
@@ -874,7 +898,7 @@ impl GfxApi
 
     /// Allocate environment map cubemap samplers\
     /// Returned tuple contains the environment map, irradiance map, and prefiltered map's
-    /// [EnvironmentTextureData]
+    /// [TextureData]
     fn allocate_environment_map_samplers(
         memory_allocator: Arc<dyn MemoryAllocator>,
         command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
@@ -886,7 +910,7 @@ impl GfxApi
         irradiance_map_pipeline_data: &CubemapComputePipelineData,
         prefiltered_map_pipeline_data: &CubemapComputePipelineData,
         image_data: ImageData,
-    ) -> EnvironmentTextureData
+    ) -> (TextureData, TextureData, TextureData)
     {
         let texture_info = Texture {
             filepath: String::from("environment_map"),
@@ -933,11 +957,11 @@ impl GfxApi
             .get(format!("{}_{PREFILTERED_MAP_SUFFIX}", &texture_info.filepath).as_str())
             .expect("Failed to retrieve prefiltered map cubemap texture data");
 
-        EnvironmentTextureData {
-            environment_map: cubemap_texture_data.clone(),
-            irradiance_map: irradiance_map_texture_data.clone(),
-            prefiltered_map: prefiltered_map_texture_data.clone(),
-        }
+        (
+            cubemap_texture_data.clone(),
+            irradiance_map_texture_data.clone(),
+            prefiltered_map_texture_data.clone(),
+        )
     }
 
     /// Allocate multiple textures and their samplers using the given [ImageData] and [Texture] data
@@ -1648,6 +1672,121 @@ impl GfxApi
         }
     }
 
+    /// BRDF integration map generation
+    fn generate_brdf_integration_map(
+        memory_allocator: Arc<dyn MemoryAllocator>,
+        command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+        descriptor_set_allocator: Arc<dyn DescriptorSetAllocator>,
+        compute_queue: Arc<Queue>,
+        size: [u32; 2],
+    ) -> TextureData
+    {
+        let device = compute_queue.device().clone();
+
+        // Create output image and image view for BRDF integration map
+        let output_image_create_info = ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format: Format::R16G16_SFLOAT,
+            extent: [size[0], size[1], 1],
+            usage: ImageUsage::SAMPLED | ImageUsage::STORAGE,
+            ..Default::default()
+        };
+
+        let output_image = Image::new(
+            memory_allocator.clone(),
+            output_image_create_info,
+            AllocationCreateInfo::default(),
+        )
+        .expect("Failed to create image for BRDF integration map");
+
+        let output_image_view_create_info = ImageViewCreateInfo::from_image(&output_image);
+        let output_image_view = ImageView::new(output_image, output_image_view_create_info)
+            .expect("Failed to create image view for BRDF integration map");
+
+        // Create BRDF integration compute pipeline (this function is expected to be only called
+        // once in the entire application, so it should be fine to create the pipeline here since
+        // it is not going to be reused later)
+        let shader = Self::load_shader(device.clone(), BRDF_INTEGRATION_MAP_SHADER_PATH);
+        let shader_stage_create_info = PipelineShaderStageCreateInfo::new(shader);
+
+        let output_descriptor_set_layout_binding = DescriptorSetLayoutBinding {
+            stages: ShaderStages::COMPUTE,
+            ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::StorageImage)
+        };
+
+        let output_descriptor_set_layout_create_info = DescriptorSetLayoutCreateInfo {
+            bindings: BTreeMap::from([(0, output_descriptor_set_layout_binding)]),
+            ..DescriptorSetLayoutCreateInfo::default()
+        };
+
+        let output_descriptor_set_layout =
+            DescriptorSetLayout::new(device.clone(), output_descriptor_set_layout_create_info)
+                .expect("Failed to create output descriptor set layout for BRDF integration");
+
+        let pipeline_layout_create_info = PipelineLayoutCreateInfo {
+            set_layouts: vec![output_descriptor_set_layout],
+            ..PipelineLayoutCreateInfo::default()
+        };
+
+        let pipeline_layout = PipelineLayout::new(device.clone(), pipeline_layout_create_info)
+            .expect("Failed to create compute pipeline layout for BRDF integration");
+
+        let pipeline_create_info = ComputePipelineCreateInfo {
+            ..ComputePipelineCreateInfo::stage_layout(shader_stage_create_info, pipeline_layout)
+        };
+
+        let pipeline = ComputePipeline::new(device.clone(), None, pipeline_create_info)
+            .expect("Failed to create cubemap compute pipeline");
+
+        // Create command buffer builder, descriptor set, and register compute shader commands
+        let mut compute_command_buffer_builder = AutoCommandBufferBuilder::primary(
+            command_buffer_allocator.clone(),
+            compute_queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .expect("Failed to create compute command buffer for BRDF integration map generation");
+
+        let descriptor_set = DescriptorSet::new(
+            descriptor_set_allocator.clone(),
+            pipeline.layout().set_layouts()[0].clone(),
+            [WriteDescriptorSet::image_view(0, output_image_view.clone())],
+            [],
+        )
+        .expect("Failed to create descriptor set for BRDF integration");
+
+        Self::register_compute_dispatch_command(
+            &mut compute_command_buffer_builder,
+            &pipeline,
+            descriptor_set,
+            [size[0] / 16, size[1] / 16, 1],
+            "BRDF integration map",
+        );
+
+        // Execute compute command buffer and wait until it is done
+        compute_command_buffer_builder
+            .build()
+            .expect("Failed to build BRDF integration compute command buffer builder")
+            .execute(compute_queue.clone())
+            .expect("Failed to execute BRDF integration compute commands")
+            .then_signal_fence_and_flush()
+            .expect("Failed to register fence signal for BRDF integration compute execute")
+            .wait(None) // Block until shader is finished
+            .expect("Failed to wait for BRDF integration compute dispatch");
+
+        // Create sampler and return texture data
+        let sampler_create_info = SamplerCreateInfo {
+            min_filter: Filter::Linear,
+            mag_filter: Filter::Linear,
+            address_mode: [SamplerAddressMode::ClampToEdge; 3],
+            ..Default::default()
+        };
+
+        let sampler = Sampler::new(device.clone(), sampler_create_info)
+            .expect("Failed to create sampler for BRDF integration map");
+
+        TextureData { image_view: output_image_view, sampler }
+    }
+
     /// Allocate vertex and index buffers on the device using given [Mesh] data
     fn allocate_vertex_data_buffers(
         memory_allocator: Arc<dyn MemoryAllocator>,
@@ -2218,8 +2357,8 @@ impl GfxApi
             ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
         };
 
-        // Irradiance map and prefiltered map bindings
-        let environment_map_image_binding = DescriptorSetLayoutBinding {
+        // Generic image sampler binding
+        let image_sampler_binding = DescriptorSetLayoutBinding {
             descriptor_count: 1,
             stages: ShaderStages::FRAGMENT,
             ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::CombinedImageSampler)
@@ -2228,8 +2367,9 @@ impl GfxApi
         let environment_map_layout_info = DescriptorSetLayoutCreateInfo {
             bindings: BTreeMap::from([
                 (0, environment_map_data_binding),
-                (1, environment_map_image_binding.clone()), // Irradiance map
-                (2, environment_map_image_binding),         // Prefiltered map
+                (1, image_sampler_binding.clone()), // Irradiance map
+                (2, image_sampler_binding.clone()), // Prefiltered map
+                (3, image_sampler_binding),         // BRDF integration map
             ]),
             ..DescriptorSetLayoutCreateInfo::default()
         };
@@ -2320,21 +2460,28 @@ impl GfxApi
     /// If an environment map is already loaded it will be replaced with the new one
     pub fn init_environment_map(&mut self, image_data: ImageData)
     {
-        let environment_texture_data = Self::allocate_environment_map_samplers(
-            self.memory_allocator.clone(),
-            self.command_buffer_allocator.clone(),
-            self.descriptor_set_allocator.clone(),
-            self.device.clone(),
-            self.graphics_queue.clone(),
-            self.compute_queue.clone(),
-            &self.cubemap_conversion_pipeline_data,
-            &self.irradiance_map_pipeline_data,
-            &self.prefiltered_map_pipeline_data,
-            image_data,
-        );
+        let (env_map_texture_data, irradiance_map_texture_data, prefiltered_map_texture_data) =
+            Self::allocate_environment_map_samplers(
+                self.memory_allocator.clone(),
+                self.command_buffer_allocator.clone(),
+                self.descriptor_set_allocator.clone(),
+                self.device.clone(),
+                self.graphics_queue.clone(),
+                self.compute_queue.clone(),
+                &self.cubemap_conversion_pipeline_data,
+                &self.irradiance_map_pipeline_data,
+                &self.prefiltered_map_pipeline_data,
+                image_data,
+            );
 
         // Actual descriptor set will be updated after frame rendering is done
-        self.environment_texture_data = environment_texture_data;
+        self.environment_texture_data = EnvironmentTextureData {
+            environment_map: env_map_texture_data,
+            irradiance_map: irradiance_map_texture_data,
+            prefiltered_map: prefiltered_map_texture_data,
+            brdf_integration_map: self.environment_texture_data.brdf_integration_map.clone(),
+        };
+
         self.updated_environment_map_texture = true;
     }
 
@@ -2896,6 +3043,11 @@ impl GfxApi
                     2,
                     self.environment_texture_data.prefiltered_map.image_view.clone(),
                     self.environment_texture_data.prefiltered_map.sampler.clone(),
+                ),
+                WriteDescriptorSet::image_view_sampler(
+                    3,
+                    self.environment_texture_data.brdf_integration_map.image_view.clone(),
+                    self.environment_texture_data.brdf_integration_map.sampler.clone(),
                 ),
             ],
             [],
