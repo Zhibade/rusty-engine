@@ -91,7 +91,7 @@ impl System for MaterialRenderingSystem
                     let image_data = match texture.filepath.as_str()
                     {
                         DEFAULT_COLOR_TEXTURE_PATH => ImageData::default_white(),
-                        DEFAULT_ORM_TEXTURE_PATH => ImageData::default_black(),
+                        DEFAULT_ORM_TEXTURE_PATH => ImageData::default_orm(),
                         DEFAULT_NORMAL_TEXTURE_PATH => ImageData::default_normal(),
                         _ => load_image(&texture.filepath),
                     };

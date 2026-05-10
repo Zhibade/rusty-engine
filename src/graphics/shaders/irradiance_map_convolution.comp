@@ -1,7 +1,7 @@
 #version 450
 #include "math.glsl"
 
-#define MAX_CONTRIBUTION 10
+#define MAX_CONTRIBUTION 5000
 
 // When multiplied, it is recommended that the total value is in the range 128 - 512 for better occupancy
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
@@ -43,7 +43,7 @@ void main()
 	// the actual cubemap space, this is so that the calculation is simplified and don't need to be calculating
 	// the theta and phi ranges per pixel and so on
 
-	const float angleIncrement = 0.025; // The smaller it is the better but increases calculation time (GPU could time out)
+	const float angleIncrement = 0.02; // The smaller it is the better but increases calculation time (GPU could time out)
 
 	// Theta = Azimuth angle (full 360 degrees)
 	// Phi = Zenith angle (90 degrees since it is a hemisphere)
@@ -57,7 +57,7 @@ void main()
 
 			vec4 color = texture(inputImage, sampleDirection);
 
-			// Some HDR textures have extremely bright values that can cause artifacts on the irradiance map
+			// Some HDR textures have extremely bright values that can cause artifacts (fireflies) on the irradiance map
 			// It is better to clamp the HDR values, just in case
 			color = normalize(color) * min(length(color), MAX_CONTRIBUTION);
 

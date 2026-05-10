@@ -90,3 +90,14 @@ float geometrySmith(vec3 normal, vec3 view, vec3 light, float roughness)
 
     return ggx1 * ggx2;
 }
+
+// Schlick's fresnel approximation
+// angleDot is the dot product of the view-normal or half vector-view angle
+// reflectivity (also known as F0) is the reflection color based on whether it is dielectric or not)
+vec3 fresnelSchlick(float angleDot, vec3 reflectivity, float roughness)
+{
+    float angle = clamp(1 - angleDot, 0, 1);
+    vec3 reflection = max(vec3(1.0 - roughness), reflectivity) - reflectivity;
+
+    return reflectivity + reflection * pow(angle, 5.0);
+}

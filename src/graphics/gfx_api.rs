@@ -77,9 +77,10 @@ use winit::window::Window;
 // ------
 
 const VIEW_PROJ_DESCRIPTOR_SET_LAYOUT_INDEX: usize = 0;
-const TEXTURES_DESCRIPTOR_SET_LAYOUT_INDEX: usize = 1;
-const LIGHTING_DESCRIPTOR_SET_LAYOUT_INDEX: usize = 2;
-const PBR_PARAMS_DESCRIPTOR_SET_LAYOUT_INDEX: usize = 3;
+const FRAGMENT_SHADER_EXTRA_DATA_SET_LAYOUT_INDEX: usize = 1;
+const TEXTURES_DESCRIPTOR_SET_LAYOUT_INDEX: usize = 2;
+const LIGHTING_DESCRIPTOR_SET_LAYOUT_INDEX: usize = 3;
+const PBR_PARAMS_DESCRIPTOR_SET_LAYOUT_INDEX: usize = 4;
 
 const CUBEMAP_CONVERSION_SHADER_PATH: &str = "src/graphics/shaders/cubemap_conversion_comp.spv";
 const IRRADIANCE_MAP_SUFFIX: &str = "irradiance-map";
@@ -166,6 +167,15 @@ struct TextureData
 {
     image_view: Arc<ImageView>,
     sampler: Arc<Sampler>,
+}
+
+/// Extra fragment shader shared data after uploading to the GPU
+struct FragmentShaderExtraData
+{
+    data: FragmentShaderExtraDataContents,
+    buffer: Subbuffer<FragmentShaderExtraDataContents>,
+    descriptor_set: Arc<DescriptorSet>,
+    updated: bool,
 }
 
 // ------
@@ -259,6 +269,14 @@ impl Default for PbrParametersBufferData
     }
 }
 
+/// Extra shared data for use in fragment shaders
+#[derive(BufferContents, Clone)]
+#[repr(C)]
+struct FragmentShaderExtraDataContents
+{
+    view_dir: [f32; 3],
+}
+
 // ------
 // GfxApi implementation
 // ------
@@ -298,8 +316,10 @@ pub struct GfxApi
     updated_environment_map_texture: bool,
 
     view_projection_data: ViewProjectionData, // Current camera (view-projection) data
-    view_perspective_data_buffer: Subbuffer<ViewProjectionData>,
-    view_perspective_data_descriptor_set: Arc<DescriptorSet>,
+    view_projection_data_buffer: Subbuffer<ViewProjectionData>,
+    view_projection_data_descriptor_set: Arc<DescriptorSet>,
+
+    fragment_shader_extra_data: FragmentShaderExtraData,
 
     // Data related to presenting onto the surface each frame
     should_recreate_swapchain: bool,
@@ -591,6 +611,33 @@ impl GfxApi
         )
         .unwrap();
 
+        // Allocate extra fragment shader shared data
+        let fragment_shader_extra_data = {
+            let data = FragmentShaderExtraDataContents { view_dir: [0.0, 0.0, 1.0] };
+
+            let buffer = Self::allocate_data_buffer(memory_allocator.clone(), data.clone());
+
+            let set_layout = fallback_graphics_pipeline
+                .layout()
+                .set_layouts()
+                .get(FRAGMENT_SHADER_EXTRA_DATA_SET_LAYOUT_INDEX)
+                .expect("Failed to get fragment shaders extra data set layout \
+                              from fallback graphics pipeline")
+                .clone();
+
+            let descriptor_set = DescriptorSet::new(
+                descriptor_set_allocator.clone(),
+                set_layout,
+                [WriteDescriptorSet::buffer(0, buffer.clone())],
+                [],
+            )
+            .expect(
+                "Failed to create descriptor set layout for fragment shaders' extra shared data",
+            );
+
+            FragmentShaderExtraData { data, buffer, descriptor_set, updated: false }
+        };
+
         // Register fallback pipeline data
         let mut pipeline_data = HashMap::new();
         pipeline_data.insert(
@@ -632,11 +679,12 @@ impl GfxApi
             updated_environment_map_data: false,
             updated_environment_map_texture: false,
 
+            fragment_shader_extra_data,
             render_meshes_data: HashMap::new(),
             texture_data: HashMap::new(),
             view_projection_data,
-            view_perspective_data_buffer,
-            view_perspective_data_descriptor_set,
+            view_projection_data_buffer: view_perspective_data_buffer,
+            view_projection_data_descriptor_set: view_perspective_data_descriptor_set,
 
             // Data related to presenting onto the surface each frame
             should_recreate_swapchain: false,
@@ -2060,7 +2108,8 @@ impl GfxApi
         ];
 
         // Declare push constant range for objects' transform matrix,
-        // and descriptor set layout for view and perspective matrices
+        // descriptor set layout for view and perspective matrices,
+        // and the shared data for fragment shaders
         let push_constant_range = PushConstantRange {
             stages: ShaderStages::VERTEX,
             offset: 0,
@@ -2074,7 +2123,14 @@ impl GfxApi
             ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
         };
 
-        // Create descriptor set layouts for view-projection matrices
+        let fragment_shader_extra_data_set_layout_binding = DescriptorSetLayoutBinding {
+            descriptor_type: DescriptorType::UniformBuffer,
+            descriptor_count: 1,
+            stages: ShaderStages::FRAGMENT,
+            ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::UniformBuffer)
+        };
+
+        // Create descriptor set layout for view-projection matrices
         let view_proj_descriptor_set_layout_create_info = DescriptorSetLayoutCreateInfo {
             bindings: BTreeMap::from([(0, view_proj_descriptor_set_layout_binding)]),
             ..DescriptorSetLayoutCreateInfo::default()
@@ -2082,10 +2138,22 @@ impl GfxApi
 
         let view_proj_descriptor_set_layout =
             DescriptorSetLayout::new(device.clone(), view_proj_descriptor_set_layout_create_info)
-                .unwrap();
+                .expect("Failed to create descriptor set layout for view-projection matrices");
+
+        let fragment_shader_extra_data_set_layout_create_info = DescriptorSetLayoutCreateInfo {
+            bindings: BTreeMap::from([(0, fragment_shader_extra_data_set_layout_binding)]),
+            ..DescriptorSetLayoutCreateInfo::default()
+        };
+
+        let fragment_shader_extra_data_set_layout = DescriptorSetLayout::new(
+            device.clone(),
+            fragment_shader_extra_data_set_layout_create_info,
+        )
+        .expect("Failed to create descriptor set layout for fragment shader extra data");
 
         // Create pipeline layout
-        let mut descriptor_set_layouts = Vec::from([view_proj_descriptor_set_layout]);
+        let mut descriptor_set_layouts =
+            Vec::from([view_proj_descriptor_set_layout, fragment_shader_extra_data_set_layout]);
 
         // If using textures, create textures' descriptor set layout and add it to pipeline layout
         if texture_count > 0
@@ -2387,7 +2455,7 @@ impl GfxApi
             {
                 TextureUsage::Color => Format::R8G8B8A8_SRGB,
                 TextureUsage::OcclusionRoughnessMetallic => Format::R8G8B8A8_UNORM,
-                TextureUsage::Normal => Format::R8G8B8A8_SNORM,
+                TextureUsage::Normal => Format::R8G8B8A8_UNORM,
             },
 
             PixelData::HDR(_) => Format::R32G32B32A32_SFLOAT,
@@ -2811,7 +2879,10 @@ impl GfxApi
                 }
             };
 
-            let mut descriptor_sets = vec![self.view_perspective_data_descriptor_set.clone()];
+            let mut descriptor_sets = vec![
+                self.view_projection_data_descriptor_set.clone(),
+                self.fragment_shader_extra_data.descriptor_set.clone(),
+            ];
 
             // Add textures' descriptor set if it exists
             if let Some(ref textures_descriptor_set) = pipeline_data.textures_descriptor_set
@@ -2884,6 +2955,7 @@ impl GfxApi
 
         // Update necessary buffers before execution
         self.update_view_projection_buffer();
+        self.update_fragment_shader_extra_data_buffer();
         self.update_lighting_buffers();
         self.update_pbr_parameters_buffers();
 
@@ -2930,6 +3002,13 @@ impl GfxApi
 
         self.view_projection_data =
             ViewProjectionData { view_matrix, perspective_matrix: flipped_perspective_matrix };
+
+        // Update camera view direction
+        let view_z_axis = &view_matrix[2];
+        self.fragment_shader_extra_data.data.view_dir =
+            [view_z_axis[0], view_z_axis[1], view_z_axis[2]];
+
+        self.fragment_shader_extra_data.updated = true;
     }
 
     /// Update current image-based lighting settings
@@ -3007,6 +3086,52 @@ impl GfxApi
                 Self::log_error(err_msg.as_str());
             }
         }
+    }
+
+    /// Update fragment shaders' extra data buffer if needed
+    /// # Panics
+    /// Will panic if this is called while the GPU is using the uniform buffer\
+    /// Need to wait until the previous frame is finished processing before calling this function
+    fn update_fragment_shader_extra_data_buffer(&mut self)
+    {
+        if !self.fragment_shader_extra_data.updated
+        {
+            return;
+        }
+
+        // Update buffer
+        let mut buffer_write = self
+            .fragment_shader_extra_data
+            .buffer
+            .write()
+            .expect("Failed to lock fragment shaders' extra data buffer for writing");
+
+        *buffer_write = self.fragment_shader_extra_data.data.clone();
+
+        // Fragment shaders' extra shared data is always the same on all shaders,
+        // so just use the fallback pipeline to retrieve the layout
+        let graphics_pipeline = &self
+            .pipeline_data
+            .get(FALLBACK_PIPELINE_NAME)
+            .expect("Failed retrieving the fallback graphics pipeline")
+            .graphics_pipeline;
+
+        let descriptor_set_layout = graphics_pipeline
+            .layout()
+            .set_layouts()
+            .get(FRAGMENT_SHADER_EXTRA_DATA_SET_LAYOUT_INDEX)
+            .unwrap()
+            .clone();
+
+        self.fragment_shader_extra_data.descriptor_set = DescriptorSet::new(
+            self.descriptor_set_allocator.clone(),
+            descriptor_set_layout,
+            [WriteDescriptorSet::buffer(0, self.fragment_shader_extra_data.buffer.clone())],
+            [],
+        )
+        .expect("Failed to recreate fragment shaders' extra data descriptor set");
+
+        self.fragment_shader_extra_data.updated = false;
     }
 
     /// Update environment map lighting data buffer if needed
@@ -3119,7 +3244,7 @@ impl GfxApi
     /// Need to wait until the previous frame is finished processing before calling this function
     fn update_view_projection_buffer(&mut self)
     {
-        let mut buffer_write = self.view_perspective_data_buffer.write().unwrap();
+        let mut buffer_write = self.view_projection_data_buffer.write().unwrap();
         *buffer_write = self.view_projection_data.clone();
 
         // View projection descriptor set is always the same on all shaders,
@@ -3137,10 +3262,10 @@ impl GfxApi
             .unwrap()
             .clone();
 
-        self.view_perspective_data_descriptor_set = DescriptorSet::new(
+        self.view_projection_data_descriptor_set = DescriptorSet::new(
             self.descriptor_set_allocator.clone(),
             descriptor_set_layout,
-            [WriteDescriptorSet::buffer(0, self.view_perspective_data_buffer.clone())],
+            [WriteDescriptorSet::buffer(0, self.view_projection_data_buffer.clone())],
             [],
         )
         .expect("Failed to update view projection data buffer");

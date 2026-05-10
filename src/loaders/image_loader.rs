@@ -41,6 +41,16 @@ impl ImageData
         ImageData { data: PixelData::SDR(Vec::from([0; 4])), size: [1, 1], ..Self::default() }
     }
 
+    /// Create 1x1 fully reflective metallic ORM (occlusion-roughness-metallic) image data
+    pub fn default_orm() -> Self
+    {
+        ImageData {
+            data: PixelData::SDR(Vec::from([255, 0, 255, 255])),
+            size: [1, 1],
+            ..Self::default()
+        }
+    }
+
     /// Create 1x1 neutral normal image data
     pub fn default_normal() -> Self
     {

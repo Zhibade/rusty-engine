@@ -5,18 +5,18 @@
 // ------
 
 // Lighting settings + environment/irradiance map sampler
-layout(set = 2, binding = 0) uniform EnvironmentMapData
+layout(set = 3, binding = 0) uniform EnvironmentMapData
 {
     float exposure;
     float angle;
 } lighting_settings;
 
-layout(set = 2, binding = 1) uniform samplerCube irradianceMap;
-layout(set = 2, binding = 2) uniform samplerCube prefilteredMap;
-layout(set = 2, binding = 3) uniform sampler2D brdfIntegrationMap;
+layout(set = 3, binding = 1) uniform samplerCube irradianceMap;
+layout(set = 3, binding = 2) uniform samplerCube prefilteredMap;
+layout(set = 3, binding = 3) uniform sampler2D brdfIntegrationMap;
 
 // PBR parameters
-layout(set = 3, binding = 0) uniform PbrParameters
+layout(set = 4, binding = 0) uniform PbrParameters
 {
     vec4 color_tint;
     float occlusion_strength;
