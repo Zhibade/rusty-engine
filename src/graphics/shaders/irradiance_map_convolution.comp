@@ -1,8 +1,6 @@
 #version 450
 #include "math.glsl"
 
-#define MAX_CONTRIBUTION 5000
-
 // When multiplied, it is recommended that the total value is in the range 128 - 512 for better occupancy
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -27,6 +25,12 @@ void main()
 
 	vec4 irradiance = vec4(0);
 	float totalSamples = 0;
+
+	// Using lower mipmap level as a workaround to prevent "firefly" artifacts when a cubemap has just a few pixels
+	// that have a huge exposure difference
+	int totalMipmaps = textureQueryLevels(inputImage);
+	int midMipmapLevel = totalMipmaps / 2 - 1;
+	midMipmapLevel = min(midMipmapLevel, totalMipmaps);
 
 	// Convert from equirectangular UV to spherical coordinates
 	float currentTheta = currentUv.x * 2 * PI;
@@ -55,11 +59,7 @@ void main()
 			vec3 tangentDirection = getDirectionVectorFromSphereCoords(theta, phi);
 			vec3 sampleDirection = tangentDirection.x * right + tangentDirection.y * direction + tangentDirection.z * up;
 
-			vec4 color = texture(inputImage, sampleDirection);
-
-			// Some HDR textures have extremely bright values that can cause artifacts (fireflies) on the irradiance map
-			// It is better to clamp the HDR values, just in case
-			color = normalize(color) * min(length(color), MAX_CONTRIBUTION);
+			vec4 color = textureLod(inputImage, sampleDirection, midMipmapLevel);
 
 			// cos(phi): The larger the angle is, the less it contributes
 			// sin(phi): Increases contribution of samples near the up axis (since the sample area gets smaller)

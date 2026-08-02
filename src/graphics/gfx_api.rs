@@ -621,8 +621,10 @@ impl GfxApi
                 .layout()
                 .set_layouts()
                 .get(FRAGMENT_SHADER_EXTRA_DATA_SET_LAYOUT_INDEX)
-                .expect("Failed to get fragment shaders extra data set layout \
-                              from fallback graphics pipeline")
+                .expect(
+                    "Failed to get fragment shaders extra data set layout \
+                              from fallback graphics pipeline",
+                )
                 .clone();
 
             let descriptor_set = DescriptorSet::new(
@@ -836,28 +838,48 @@ impl GfxApi
         )
         .expect("Failed to create graphics command buffer for cubemap mipmap generation");
 
+        // Need to create another graphics and compute command buffers to generate source cubemap
+        // + mipmaps before irradiance and prefiltered maps generation since they are used in there
+        //
+        // NOTE: Instead of using mipmaps to prevent "firefly" artifacts,
+        // a solution like "Fast Filtering of Reflection Probes" could be used, but this
+        // seems to relatively work fine for now.
+        let mut extra_compute_command_buffer_builder = AutoCommandBufferBuilder::primary(
+            command_buffer_allocator.clone(),
+            compute_queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .expect("Failed to create extra compute command buffer for cubemap compute processing");
+
+        let mut extra_graphics_command_buffer_builder = AutoCommandBufferBuilder::primary(
+            command_buffer_allocator.clone(),
+            graphics_queue.queue_family_index(),
+            CommandBufferUsage::OneTimeSubmit,
+        )
+        .expect("Failed to create extra graphics command buffer for cubemap mipmap generation");
+
         // Create target cubemap textures
         for (path, texture_data) in cubemap_texture_data
         {
-            // Convert equirectangular texture to cubemap and generate mipmaps
-            let cubemap_data = Self::register_cubemap_conversion_commands(
-                memory_allocator.clone(),
-                descriptor_set_allocator.clone(),
-                cubemap_conversion_pipeline_data,
-                &mut compute_command_buffer_builder,
-                texture_data,
-                false,
-                path,
-            );
-
-            Self::register_mipmap_generation_commands(
-                &mut graphics_command_buffer_builder,
-                &cubemap_data.image_view.image(),
-            );
-
             // If it is an environment map, generate an irradiance map and prefiltered map as well
             if is_environment_map
             {
+                // Convert equirectangular texture to cubemap and generate mipmaps
+                let cubemap_data = Self::register_cubemap_conversion_commands(
+                    memory_allocator.clone(),
+                    descriptor_set_allocator.clone(),
+                    cubemap_conversion_pipeline_data,
+                    &mut extra_compute_command_buffer_builder,
+                    texture_data,
+                    false,
+                    path,
+                );
+
+                Self::register_mipmap_generation_commands(
+                    &mut extra_graphics_command_buffer_builder,
+                    &cubemap_data.image_view.image(),
+                );
+
                 // Irradiance map generation (equirectangular) -> convert to cubemap ->
                 // mipmap generation
                 let irradiance_equirectangular_map_data =
@@ -914,21 +936,84 @@ impl GfxApi
 
                 let prefiltered_map_path = format!("{path}_{PREFILTERED_MAP_SUFFIX}").to_string();
                 new_cubemap_data.insert(prefiltered_map_path, prefiltered_map_data);
-            }
 
-            new_cubemap_data.insert(String::from(path), cubemap_data);
+                new_cubemap_data.insert(String::from(path), cubemap_data);
+            }
+            else
+            {
+                // If it is not an environment map, just register the cubemap conversion +
+                // mipmap generation commands on the regular command buffers
+                let cubemap_data = Self::register_cubemap_conversion_commands(
+                    memory_allocator.clone(),
+                    descriptor_set_allocator.clone(),
+                    cubemap_conversion_pipeline_data,
+                    &mut compute_command_buffer_builder,
+                    texture_data,
+                    false,
+                    path,
+                );
+
+                Self::register_mipmap_generation_commands(
+                    &mut graphics_command_buffer_builder,
+                    &cubemap_data.image_view.image(),
+                );
+
+                new_cubemap_data.insert(String::from(path), cubemap_data);
+            }
         }
 
-        // Execute compute command buffer and wait until it is done
-        compute_command_buffer_builder
-            .build()
-            .expect("Failed to build environment map compute command buffer builder")
-            .execute(compute_queue.clone())
-            .expect("Failed to upload image to GPU")
-            .then_signal_fence_and_flush()
-            .expect("Failed to register fence signal for environment map compute execute")
-            .wait(None) // Block until cubemaps are processed
-            .expect("Failed to wait for cubemap processing");
+        if is_environment_map
+        {
+            // Run extra command buffers first before the shared compute and graphics command
+            // buffers
+            //
+            // (Getting "All submitted commands that refer to imageView must have completed
+            // execution" error when using fences between queues, so just leaving it as an
+            // explicit CPU wait for now)
+            extra_compute_command_buffer_builder
+                .build()
+                .expect("Failed to build extra environment map compute command buffer builder")
+                .execute(compute_queue.clone())
+                .expect("Failed to execute extra environment map compute command buffer")
+                .then_signal_fence_and_flush()
+                .expect("Failed to register fence signal for extra environment map compute execute")
+                .wait(None)
+                .expect("Failed to wait for extra cubemap processing");
+
+            extra_graphics_command_buffer_builder
+                .build()
+                .expect("Failed to build extra environment map graphics command buffer builder")
+                .execute(graphics_queue.clone())
+                .expect("Failed to execute extra environment map graphics command buffer")
+                .then_signal_fence_and_flush()
+                .expect("Failed to register fence signal for extra environment map graphics command buffer execution")
+                .wait(None)
+                .expect("Failed to wait for extra mipmap generation");
+
+            compute_command_buffer_builder
+                .build()
+                .expect("Failed to build environment map compute command buffer builder")
+                .execute(compute_queue.clone())
+                .expect("Failed to execute environment map compute command buffer")
+                .then_signal_fence_and_flush()
+                .expect("Failed to register fence signal for environment map compute execute")
+                .wait(None) // Block until environment maps are processed
+                .expect("Failed to wait for cubemap processing");
+        }
+        else
+        {
+            // When not generating  all environment maps, just execute compute command buffer as is
+            // and wait
+            compute_command_buffer_builder
+                .build()
+                .expect("Failed to build environment map compute command buffer builder")
+                .execute(compute_queue.clone())
+                .expect("Failed to execute environment map compute command buffer")
+                .then_signal_fence_and_flush()
+                .expect("Failed to register fence signal for environment map compute execute")
+                .wait(None) // Block until environment maps are processed
+                .expect("Failed to wait for cubemap processing");
+        }
 
         // Execute graphics command buffer (for mipmap generation) and wait until it is done
         graphics_command_buffer_builder

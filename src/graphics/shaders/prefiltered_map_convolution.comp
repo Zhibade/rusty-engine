@@ -1,7 +1,6 @@
 #version 450
 #include "math.glsl"
 
-#define MAX_CONTRIBUTION 5000
 #define NUM_OF_SAMPLES 1500 // Increasing this increases quality but may cause GPU to timeout
 
 // When multiplied, it is recommended that the total value is in the range 128 - 512 for better occupancy
@@ -60,10 +59,9 @@ void main()
 		float contribution = max(dot(normal, sampleVector), 0);
 		if (contribution > 0)
 		{
-            // Some HDR textures have extremely bright values that can cause artifacts (fireflies) on the prefiltered map
-            // It is better to clamp the HDR values, just in case
-            vec4 sampleColor = texture(inputImage, sampleVector);
-            sampleColor = normalize(sampleColor) * min(length(sampleColor), MAX_CONTRIBUTION);
+			// Sampling higher cubemap mipmap level to prevent "firefly" artifacts on higher roughness
+			// "Fireflies" are caused when a few pixels in the cubemap have a huge exposure difference
+            vec4 sampleColor = textureLod(inputImage, sampleVector, env_map_compute_constants.current_mipmap);
 
 			color += sampleColor * contribution;
 			totalWeight += contribution;
