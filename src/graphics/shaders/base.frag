@@ -75,10 +75,5 @@ void main()
     vec3 ibl_specular = exposure * reflection * (specularContribution * brdf.x + brdf.y);
 
     vec3 ibl = (ibl_albedo + ibl_specular) * vec3(occlusion);
-
-    // Tonemapping + Gamma correction
-    vec3 tonemapped_ibl = ibl / (ibl + vec3(1));
-    vec3 gamma_corrected_ibl = pow(tonemapped_ibl, vec3(1.0/2.2));
-
-    f_color = vec4(gamma_corrected_ibl, 1);
+    f_color = vec4(ibl, 1); // HDR color is outputted
 }

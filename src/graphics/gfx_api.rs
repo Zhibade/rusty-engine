@@ -17,7 +17,7 @@ use vulkano::command_buffer::allocator::{
 use vulkano::command_buffer::{
     AutoCommandBufferBuilder, BlitImageInfo, CommandBufferExecFuture, CommandBufferUsage,
     CopyBufferInfo, CopyBufferToImageInfo, ImageBlit, PrimaryAutoCommandBuffer,
-    PrimaryCommandBufferAbstract, RenderPassBeginInfo,
+    PrimaryCommandBufferAbstract, RenderPassBeginInfo, SubpassBeginInfo, SubpassEndInfo,
 };
 use vulkano::descriptor_set::allocator::{
     DescriptorSetAllocator, StandardDescriptorSetAllocator,
@@ -52,7 +52,7 @@ use vulkano::pipeline::graphics::depth_stencil::{DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{CullMode, FrontFace, RasterizationState};
-use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition};
+use vulkano::pipeline::graphics::vertex_input::{Vertex, VertexDefinition, VertexInputState};
 use vulkano::pipeline::graphics::viewport::{Scissor, Viewport, ViewportState};
 use vulkano::pipeline::layout::{PipelineLayoutCreateInfo, PushConstantRange};
 use vulkano::pipeline::{
@@ -95,6 +95,15 @@ const FALLBACK_PIPELINE_NAME: &str = "Fallback";
 const FALLBACK_VERTEX_SHADER_PATH: &str = "src/graphics/shaders/base_vert.spv";
 const FALLBACK_FRAGMENT_SHADER_PATH: &str = "src/graphics/shaders/fallback_frag.spv";
 
+const HDR_FORMAT: Format = Format::A2B10G10R10_UNORM_PACK32;
+const SDR_FORMAT: Format = Format::R8G8B8A8_SRGB;
+
+// ------
+// Aliases
+// ------
+
+type SubpassAttachments = Vec<Arc<ImageView>>;
+
 // ------
 // Internal enums
 // ------
@@ -133,13 +142,21 @@ struct EnvironmentTextureData
 }
 
 /// Shader/material pipeline and texture assignments data
-struct PipelineData
+struct MaterialPipelineData
 {
     graphics_pipeline: Arc<GraphicsPipeline>,
     lighting_mode: LightingMode,
     pbr_parameters_data: Option<PbrParametersData>,
     texture_assignments: HashMap<TextureUsage, String>,
     textures_descriptor_set: Option<Arc<DescriptorSet>>,
+}
+
+/// Post process pipeline and intermediate render target(s) descriptor set
+struct PostProcessPipelineData
+{
+    graphics_pipeline: Arc<GraphicsPipeline>,
+    attachments_image_views: Vec<SubpassAttachments>, // One set per swapchain image
+    attachments_descriptor_sets: Vec<Arc<DescriptorSet>>, // One per swapchain image
 }
 
 /// PBR parameters data after uploading to the GPU
@@ -292,7 +309,11 @@ pub struct GfxApi
     swapchain: Arc<Swapchain>,
     viewport: Viewport,
     render_pass: Arc<RenderPass>,
-    pipeline_data: HashMap<String, PipelineData>, // Unique name -> Pipeline data
+
+    // Unique name -> Material pipeline data
+    material_pipeline_data: HashMap<String, MaterialPipelineData>,
+    post_processing_pipelines: Vec<PostProcessPipelineData>, // Ordered post process subpasses
+
     cubemap_conversion_pipeline_data: CubemapComputePipelineData,
     irradiance_map_pipeline_data: CubemapComputePipelineData,
     prefiltered_map_pipeline_data: CubemapComputePipelineData,
@@ -451,10 +472,10 @@ impl GfxApi
         Self::log_depth_stencil_format(&depth_stencil_format);
 
         // Create single pass render pass
-        let render_pass = vulkano::single_pass_renderpass!(
+        let render_pass = vulkano::ordered_passes_renderpass!(
             device.clone(),
             attachments: {
-                color: {
+                color_ldr: {
                     format: swapchain.image_format(),
                     samples: 1,
                     load_op: Clear,
@@ -466,11 +487,25 @@ impl GfxApi
                     load_op: Clear,
                     store_op: DontCare,
                 },
+                color_hdr: {
+                    format: HDR_FORMAT,
+                    samples: 1,
+                    load_op: Clear,
+                    store_op: DontCare,
+                },
             },
-            pass: {
-                color: [color],
-                depth_stencil: { depth_stencil },
-            },
+            passes: [
+                {
+                    color: [color_hdr],
+                    depth_stencil: { depth_stencil },
+                    input: []
+                },
+                {
+                    color: [color_ldr],
+                    depth_stencil: {},
+                    input: [color_hdr]
+                }
+            ],
         )
         .unwrap();
 
@@ -484,7 +519,7 @@ impl GfxApi
         let frag_shader_entry_point =
             Self::load_shader(device.clone(), FALLBACK_FRAGMENT_SHADER_PATH);
 
-        let fallback_graphics_pipeline = Self::create_graphics_pipeline(
+        let fallback_graphics_pipeline = Self::create_material_graphics_pipeline(
             &device,
             &swapchain,
             &render_pass,
@@ -523,11 +558,58 @@ impl GfxApi
 
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
+        // Create default tonemapper's graphics pipeline and intermediate render targets
+        let post_process_vert_shader_entry_point =
+            Self::load_shader(device.clone(), "src/graphics/shaders/tonemapping_vert.spv");
+
+        let post_process_frag_shader_entry_point =
+            Self::load_shader(device.clone(), "src/graphics/shaders/tonemapping_frag.spv");
+
+        let tonemapper_graphics_pipeline = Self::create_post_process_graphics_pipeline(
+            &device,
+            &swapchain,
+            &render_pass,
+            post_process_vert_shader_entry_point,
+            post_process_frag_shader_entry_point,
+            1,
+        );
+
+        // Create one set of attachments per swapchain image
+        let mut tonemapper_attachments = Vec::new();
+        let mut tonemapper_descriptor_sets = Vec::new();
+
+        for image in &swapchain_images
+        {
+            let (tonemapper_image_views, tonemapper_descriptor_set) =
+                Self::create_post_process_attachments(
+                    memory_allocator.clone(),
+                    descriptor_set_allocator.clone(),
+                    tonemapper_graphics_pipeline.layout().set_layouts()[0].clone(),
+                    image.extent(),
+                    true,
+                );
+
+            tonemapper_attachments.push(tonemapper_image_views);
+            tonemapper_descriptor_sets.push(tonemapper_descriptor_set);
+        }
+
+        let tonemapper_pipeline_data = PostProcessPipelineData {
+            graphics_pipeline: tonemapper_graphics_pipeline,
+            attachments_image_views: tonemapper_attachments,
+            attachments_descriptor_sets: tonemapper_descriptor_sets,
+        };
+
+        let post_processing_pipelines = Vec::from([tonemapper_pipeline_data]);
+
         // Create matching framebuffers for swapchain images
+        let tonemapper_subpass_attachments =
+            post_processing_pipelines.first().unwrap().attachments_image_views.clone();
+
         let framebuffers = Self::create_framebuffers(
             memory_allocator.clone(),
             &swapchain_images,
             &render_pass,
+            &Vec::from([tonemapper_subpass_attachments]),
             depth_stencil_format,
         );
 
@@ -644,7 +726,7 @@ impl GfxApi
         let mut pipeline_data = HashMap::new();
         pipeline_data.insert(
             FALLBACK_PIPELINE_NAME.to_string(),
-            PipelineData {
+            MaterialPipelineData {
                 graphics_pipeline: fallback_graphics_pipeline,
                 lighting_mode: LightingMode::Unlit,
                 pbr_parameters_data: None,
@@ -661,7 +743,8 @@ impl GfxApi
             swapchain,
             viewport,
             render_pass,
-            pipeline_data,
+            material_pipeline_data: pipeline_data,
+            post_processing_pipelines,
             cubemap_conversion_pipeline_data,
             irradiance_map_pipeline_data,
             prefiltered_map_pipeline_data,
@@ -2150,8 +2233,8 @@ impl GfxApi
         pipelines
     }
 
-    /// Create and initialize the graphics pipeline that will be used for rendering
-    fn create_graphics_pipeline(
+    /// Create and initialize the graphics pipeline that will be used for rendering 3D objects
+    fn create_material_graphics_pipeline(
         device: &Arc<Device>,
         swapchain: &Arc<Swapchain>,
         render_pass: &Arc<RenderPass>,
@@ -2323,21 +2406,168 @@ impl GfxApi
         };
 
         GraphicsPipeline::new(device.clone(), None, graphics_pipeline_create_info)
-            .expect("Failed to create graphics pipeline")
+            .expect("Failed to create material graphics pipeline")
     }
 
-    /// Create a framebuffer per image and making them compatible with the given render pass
+    /// Create and initialize the graphics pipeline that will be used for post-processing
+    fn create_post_process_graphics_pipeline(
+        device: &Arc<Device>,
+        swapchain: &Arc<Swapchain>,
+        render_pass: &Arc<RenderPass>,
+        vert_shader_entry_point: EntryPoint,
+        frag_shader_entry_point: EntryPoint,
+        subpass_index: u32,
+    ) -> Arc<GraphicsPipeline>
+    {
+        let scissor = Scissor { offset: [0; 2], extent: swapchain.image_extent() };
+
+        let viewport_state = ViewportState {
+            scissors: [scissor].into_iter().collect(),
+            ..Default::default() // Not setting viewport since it is resized dynamically
+        };
+
+        let rasterization_state = RasterizationState {
+            cull_mode: CullMode::Front, // To match hard-coded vertices in vertex shader
+            front_face: FrontFace::CounterClockwise,
+            ..Default::default()
+        };
+
+        let color_blend_state = ColorBlendState {
+            attachments: Vec::from([ColorBlendAttachmentState::default()]),
+            ..Default::default()
+        };
+
+        let subpass = Subpass::from(render_pass.clone(), subpass_index).expect(
+            format!("Failed to create subpass for post process index {}", subpass_index).as_str(),
+        );
+
+        let pipeline_stages = [
+            PipelineShaderStageCreateInfo::new(vert_shader_entry_point),
+            PipelineShaderStageCreateInfo::new(frag_shader_entry_point),
+        ];
+
+        // Create descriptor set layout for post process attachments (color)
+        let descriptor_set_layout_binding = DescriptorSetLayoutBinding {
+            descriptor_type: DescriptorType::InputAttachment,
+            descriptor_count: 1,
+            stages: ShaderStages::FRAGMENT,
+            ..DescriptorSetLayoutBinding::descriptor_type(DescriptorType::InputAttachment)
+        };
+
+        let descriptor_set_layout_create_info = DescriptorSetLayoutCreateInfo {
+            bindings: BTreeMap::from([(0, descriptor_set_layout_binding.clone())]),
+            ..DescriptorSetLayoutCreateInfo::default()
+        };
+
+        let descriptor_set_layout =
+            DescriptorSetLayout::new(device.clone(), descriptor_set_layout_create_info).expect(
+                format!(
+                    "Failed to create descriptor set layout for post process index {}",
+                    subpass_index
+                )
+                .as_str(),
+            );
+
+        let pipeline_layout_create_info = PipelineLayoutCreateInfo {
+            set_layouts: Vec::from([descriptor_set_layout]),
+            ..PipelineLayoutCreateInfo::default()
+        };
+
+        let pipeline_layout = PipelineLayout::new(device.clone(), pipeline_layout_create_info)
+            .expect(
+                format!(
+                    "Failed to create pipeline layout for post process index {}",
+                    subpass_index
+                )
+                .as_str(),
+            );
+
+        let graphics_pipeline_create_info = GraphicsPipelineCreateInfo {
+            stages: pipeline_stages.into_iter().collect(),
+            // Using empty vertex input state since the vertices hard-coded in the shader
+            vertex_input_state: Some(VertexInputState::default()),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            viewport_state: Some(viewport_state),
+            rasterization_state: Some(rasterization_state),
+            multisample_state: Some(MultisampleState::default()),
+            color_blend_state: Some(color_blend_state),
+            subpass: Some(subpass.into()),
+            // Need to resize viewport if window is resized, so need to set as dynamic
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            ..GraphicsPipelineCreateInfo::layout(pipeline_layout)
+        };
+
+        GraphicsPipeline::new(device.clone(), None, graphics_pipeline_create_info).expect(
+            format!(
+                "Failed to create post processing graphics pipeline for subpass {}",
+                subpass_index
+            )
+            .as_str(),
+        )
+    }
+
+    /// Create post process render targets and then write them to a descriptor set
+    fn create_post_process_attachments(
+        memory_allocator: Arc<dyn MemoryAllocator>,
+        descriptor_set_allocator: Arc<dyn DescriptorSetAllocator>,
+        descriptor_set_layout: Arc<DescriptorSetLayout>,
+        images_extent: [u32; 3],
+        is_hdr: bool,
+    ) -> (Vec<Arc<ImageView>>, Arc<DescriptorSet>)
+    {
+        let format = if is_hdr { HDR_FORMAT } else { SDR_FORMAT };
+
+        let image_create_info = ImageCreateInfo {
+            format,
+            extent: images_extent,
+            usage: ImageUsage::INPUT_ATTACHMENT | ImageUsage::COLOR_ATTACHMENT,
+            initial_layout: ImageLayout::Undefined,
+            ..Default::default()
+        };
+
+        let image = Image::new(
+            memory_allocator.clone(),
+            image_create_info,
+            AllocationCreateInfo::default(),
+        )
+        .expect("Failed to create input attachment for post process");
+
+        let image_view_create_info = ImageViewCreateInfo::from_image(&image);
+        let image_view = ImageView::new(image, image_view_create_info)
+            .expect("Failed to create input attachment image view for post process");
+
+        let write_descriptor_set = WriteDescriptorSet::image_view(0, image_view.clone());
+
+        let descriptor_set = DescriptorSet::new(
+            descriptor_set_allocator,
+            descriptor_set_layout,
+            [write_descriptor_set],
+            [],
+        )
+        .expect("Failed to create descriptor set for post process");
+
+        (vec![image_view], descriptor_set)
+    }
+
+    /// Create a framebuffer per swapchain image and make them compatible with the given render pass
+    /// `subpass_attachments` is a vector of each subpass' attachments per swapchain image
+    /// (Each element of `subpass_attachments` has to have the same length as `swapchain_images`)
+    ///
+    /// # Panics
+    /// Will panic if any of the subpasses' set of attachments' length do not match the
+    /// `swapchain_images` length
     fn create_framebuffers(
         memory_allocator: Arc<dyn MemoryAllocator>,
-        images: &Vec<Arc<Image>>,
+        swapchain_images: &Vec<Arc<Image>>,
         render_pass: &Arc<RenderPass>,
+        subpasses_attachments: &Vec<Vec<SubpassAttachments>>,
         depth_stencil_format: Format,
     ) -> Vec<Arc<Framebuffer>>
     {
         let mut framebuffers = Vec::new();
 
         // Create a framebuffer per swapchain image
-        for image in images
+        for (i, image) in swapchain_images.iter().enumerate()
         {
             // Create image view from each frame buffer image
             let image_view = ImageView::new_default(image.clone()).unwrap();
@@ -2366,9 +2596,27 @@ impl GfxApi
             let depth_stencil_image_view =
                 ImageView::new_default(depth_stencil_image.clone()).unwrap();
 
+            // Gather attachments
+            let mut framebuffer_attachments = Vec::from([image_view, depth_stencil_image_view]);
+            for subpass_swapchain_copies in subpasses_attachments
+            {
+                // Check that each subpass' attachments have one copy per swapchain image
+                if (subpass_swapchain_copies.len() != swapchain_images.len())
+                {
+                    panic!(
+                        "Subpass' attachments length does not match the number of swapchain images"
+                    );
+                }
+
+                for attachments in subpass_swapchain_copies.get(i)
+                {
+                    framebuffer_attachments.extend(attachments.clone());
+                }
+            }
+
             // Create framebuffer
             let framebuffer_create_info = FramebufferCreateInfo {
-                attachments: Vec::from([image_view, depth_stencil_image_view]),
+                attachments: framebuffer_attachments,
                 ..Default::default()
             };
 
@@ -2672,10 +2920,10 @@ impl GfxApi
         self.render_meshes_data.insert(mesh.filepath.clone(), render_mesh_data);
     }
 
-    /// Initialize vertex and fragment shaders pair
+    /// Initialize vertex and fragment shaders pair (meant for 3D object materials)
     /// # Panics
     /// Will panic if any of the shader files is not found or corrupted
-    pub fn init_shaders(
+    pub fn init_material_shaders(
         &mut self,
         vertex_shader_path: &str,
         fragment_shader_path: &str,
@@ -2688,7 +2936,7 @@ impl GfxApi
         let vert_shader_entry_point = Self::load_shader(self.device.clone(), vertex_shader_path);
         let frag_shader_entry_point = Self::load_shader(self.device.clone(), fragment_shader_path);
 
-        let graphics_pipeline = Self::create_graphics_pipeline(
+        let graphics_pipeline = Self::create_material_graphics_pipeline(
             &self.device,
             &self.swapchain,
             &self.render_pass,
@@ -2750,7 +2998,7 @@ impl GfxApi
         };
 
         // Add/update pipeline data (actual textures' data has to be set with init_textures)
-        let pipeline_data = PipelineData {
+        let pipeline_data = MaterialPipelineData {
             graphics_pipeline,
             lighting_mode,
             pbr_parameters_data,
@@ -2758,7 +3006,7 @@ impl GfxApi
             textures_descriptor_set: None,
         };
 
-        self.pipeline_data.insert(material_name.clone(), pipeline_data);
+        self.material_pipeline_data.insert(material_name.clone(), pipeline_data);
     }
 
     /// Initialize new textures for rendering (upload data to GPU)
@@ -2772,7 +3020,7 @@ impl GfxApi
     )
     {
         // Check first that the pipeline data is already initialized
-        if !self.pipeline_data.contains_key(material_name)
+        if !self.material_pipeline_data.contains_key(material_name)
         {
             let err_msg = format!(
                 "init_textures :: Pipeline data for {material_name} is not initialized.\
@@ -2810,7 +3058,7 @@ impl GfxApi
             }
 
             // Assign textures based on usage
-            self.pipeline_data
+            self.material_pipeline_data
                 .get_mut(material_name)
                 .unwrap()
                 .texture_assignments
@@ -2876,14 +3124,14 @@ impl GfxApi
 
         // Update texture descriptor set
         let graphics_pipeline = self
-            .pipeline_data
+            .material_pipeline_data
             .get(material_name)
             .expect(format!("Failed to get graphics pipeline with name: {material_name}").as_str())
             .graphics_pipeline
             .clone();
 
         let texture_assignments = &self
-            .pipeline_data
+            .material_pipeline_data
             .get(material_name)
             .expect(format!("Failed to get pipeline data for {material_name}").as_str())
             .texture_assignments;
@@ -2896,7 +3144,7 @@ impl GfxApi
             &self.texture_data,
         );
 
-        self.pipeline_data.get_mut(material_name).unwrap().textures_descriptor_set =
+        self.material_pipeline_data.get_mut(material_name).unwrap().textures_descriptor_set =
             Some(texture_descriptor_set);
     }
 
@@ -2932,6 +3180,7 @@ impl GfxApi
             clear_values: Vec::from([
                 Some([0.1, 0.1, 0.1, 1.0].into()), // Color
                 Some((1.0, 0).into()),             // Depth + stencil
+                Some([0.0, 0.0, 0.0, 0.0].into()), // HRD Color
             ]),
             ..RenderPassBeginInfo::framebuffer(self.framebuffers[image_index as usize].clone())
         };
@@ -2947,7 +3196,7 @@ impl GfxApi
         {
             // Get corresponding graphics pipeline data and textures descriptor set
             let pipeline_data = {
-                if !self.pipeline_data.contains_key(&mesh_data.pipeline_data_id)
+                if !self.material_pipeline_data.contains_key(&mesh_data.pipeline_data_id)
                 {
                     let err_msg = format!(
                         "render :: Pipeline data for [{}] not found. Using fallback pipeline/shaders",
@@ -2956,11 +3205,11 @@ impl GfxApi
 
                     Self::log_error(err_msg.as_str());
 
-                    self.pipeline_data.get(&FALLBACK_PIPELINE_NAME.to_string()).unwrap()
+                    self.material_pipeline_data.get(&FALLBACK_PIPELINE_NAME.to_string()).unwrap()
                 }
                 else
                 {
-                    self.pipeline_data.get(&mesh_data.pipeline_data_id).unwrap()
+                    self.material_pipeline_data.get(&mesh_data.pipeline_data_id).unwrap()
                 }
             };
 
@@ -2993,6 +3242,7 @@ impl GfxApi
 
             let id = &mesh_data.pipeline_data_id;
 
+            // Mesh draw commands
             command_buffer_builder
                 .bind_pipeline_graphics(pipeline_data.graphics_pipeline.clone())
                 .expect(format!("Failed to bind pipeline for {}", id).as_str())
@@ -3018,6 +3268,38 @@ impl GfxApi
                 command_buffer_builder.draw_indexed(mesh_data.index_buffer.len() as u32, 1, 0, 0, 0)
             }
             .expect(format!("Failed to register draw call for {}", id).as_str());
+        }
+
+        // Subpasses' draw commands (no need to bind vertex and index buffers
+        // since the vertices are hard-coded in the vertex shader)
+
+        for (i, post_process) in self.post_processing_pipelines.iter().enumerate()
+        {
+            command_buffer_builder
+                .next_subpass(SubpassEndInfo::default(), SubpassBeginInfo::default())
+                .expect(
+                    format!("Failed to move to post processing subpass index {}", i).as_str(),
+                )
+                .bind_pipeline_graphics(post_process.graphics_pipeline.clone())
+                .expect(
+                    format!("Failed to bind post processing pipeline for subpass {}", i).as_str(),
+                )
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    post_process.graphics_pipeline.layout().clone(),
+                    0,
+                    Vec::from([
+                        post_process.attachments_descriptor_sets[image_index as usize].clone()
+                    ]),
+                )
+                .expect(
+                    format!("Failed to bind post processing descriptor set for subpass {}", i)
+                        .as_str(),
+                );
+
+            unsafe { command_buffer_builder.draw(3, 1, 0, 0) }.expect(
+                format!("Failed to register post processing draw call for subpass {}", i).as_str(),
+            );
         }
 
         command_buffer_builder
@@ -3131,7 +3413,7 @@ impl GfxApi
     /// Call will be ignored if material does not exist
     pub fn update_pbr_parameters(&mut self, material_name: &String, pbr_parameters: &PbrParameters)
     {
-        if !self.pipeline_data.contains_key(material_name)
+        if !self.material_pipeline_data.contains_key(material_name)
         {
             let err_msg = format!(
                 "update_pbr_parameters :: Material: {material_name} ::\
@@ -3143,8 +3425,12 @@ impl GfxApi
             return;
         }
 
-        let pbr_parameters_data =
-            self.pipeline_data.get_mut(material_name).unwrap().pbr_parameters_data.as_mut();
+        let pbr_parameters_data = self
+            .material_pipeline_data
+            .get_mut(material_name)
+            .unwrap()
+            .pbr_parameters_data
+            .as_mut();
 
         // Update data if it exists
         // Otherwise log an error since shaders were not initialized as PBR
@@ -3196,7 +3482,7 @@ impl GfxApi
         // Fragment shaders' extra shared data is always the same on all shaders,
         // so just use the fallback pipeline to retrieve the layout
         let graphics_pipeline = &self
-            .pipeline_data
+            .material_pipeline_data
             .get(FALLBACK_PIPELINE_NAME)
             .expect("Failed retrieving the fallback graphics pipeline")
             .graphics_pipeline;
@@ -3275,7 +3561,7 @@ impl GfxApi
     /// Need to wait until the previous frame is finished processing before calling this function
     fn update_pbr_parameters_buffers(&mut self)
     {
-        for (material_name, pipeline_data) in self.pipeline_data.iter_mut()
+        for (material_name, pipeline_data) in self.material_pipeline_data.iter_mut()
         {
             if let Some(ref mut pbr_parameters_data) = pipeline_data.pbr_parameters_data
             {
@@ -3335,7 +3621,7 @@ impl GfxApi
         // View projection descriptor set is always the same on all shaders,
         // so just use the fallback pipeline to retrieve the layout
         let graphics_pipeline = &self
-            .pipeline_data
+            .material_pipeline_data
             .get(FALLBACK_PIPELINE_NAME)
             .expect("Failed retrieving fallback graphics pipeline")
             .graphics_pipeline;
@@ -3368,11 +3654,19 @@ impl GfxApi
 
         self.swapchain = new_swapchain;
 
+        // Gather all subpasses attachments for framebuffers
+        let mut subpasses_attachments = Vec::new();
+        for post_process in &self.post_processing_pipelines
+        {
+            subpasses_attachments.push(post_process.attachments_image_views.clone());
+        }
+
         // Need to recreate framebuffers as well so that the swapchain references are updated
         self.framebuffers = Self::create_framebuffers(
             self.memory_allocator.clone(),
             &new_swapchain_images,
             &self.render_pass,
+            &subpasses_attachments,
             self.depth_stencil_format,
         );
 

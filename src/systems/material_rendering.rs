@@ -66,7 +66,7 @@ impl System for MaterialRenderingSystem
             if !material_ref.has_been_initialized
             {
                 // Have to initialize shaders first, otherwise texture assignments can't be done
-                gfx_api_ref.init_shaders(
+                gfx_api_ref.init_material_shaders(
                     &material_ref.vertex_shader_path,
                     &material_ref.fragment_shader_path,
                     &material_ref.name,
