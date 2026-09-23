@@ -3,6 +3,7 @@
 use crate::components::camera::Camera;
 use crate::components::image_based_light::ImageBasedLight;
 use crate::components::material::{LightingMode, Material, Texture, TextureUsage};
+use crate::components::post_process::PostProcess;
 use crate::components::transform::Transform;
 use crate::core::world::World;
 use crate::graphics::gfx_api::GfxApi;
@@ -12,6 +13,7 @@ use crate::systems::light_rendering::LightRenderingSystem;
 use crate::systems::material_rendering::MaterialRenderingSystem;
 use crate::systems::mesh_rendering::MeshRenderingSystem;
 use crate::systems::mesh_rotator::MeshRotatorSystem;
+use crate::systems::post_process_rendering::PostProcessRenderingSystem;
 use glam::Vec3;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -99,10 +101,21 @@ impl App
         let env_light_id = world.add_entity();
         world.add_component(env_light_id, env_light_component);
 
+        // Add tonemapper
+        let tonemapper = PostProcess {
+            shader_path: String::from("src/graphics/shaders/tonemapping_frag.spv"),
+            ..PostProcess::default()
+        };
+
+        let post_processes_entity_id = world.add_entity();
+        world.add_component(post_processes_entity_id, tonemapper);
+
         // Register camera and systems
         let mesh_rendering_system = MeshRenderingSystem::new(self.gfx_api.clone().unwrap());
         let material_rendering_system = MaterialRenderingSystem::new(self.gfx_api.clone().unwrap());
         let light_rendering_system = LightRenderingSystem::new(self.gfx_api.clone().unwrap());
+        let post_process_rendering_system =
+            PostProcessRenderingSystem::new(self.gfx_api.clone().unwrap());
 
         let mesh_rotator_system = MeshRotatorSystem::default();
         let camera_rendering_system = CameraRenderingSystem::new(
@@ -113,6 +126,7 @@ impl App
         world.register_system(mesh_rendering_system);
         world.register_system(material_rendering_system);
         world.register_system(light_rendering_system);
+        world.register_system(post_process_rendering_system);
         world.register_system(mesh_rotator_system);
         world.register_system(camera_rendering_system);
 

@@ -31,7 +31,7 @@ use vulkano::device::physical::{PhysicalDevice, PhysicalDeviceType};
 use vulkano::device::{
     Device, DeviceCreateInfo, DeviceExtensions, Queue, QueueCreateInfo, QueueFlags,
 };
-use vulkano::format::{Format, FormatFeatures};
+use vulkano::format::{ClearValue, Format, FormatFeatures};
 use vulkano::image::sampler::{
     Filter, LOD_CLAMP_NONE, Sampler, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode,
 };
@@ -59,14 +59,18 @@ use vulkano::pipeline::{
     ComputePipeline, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
     PipelineShaderStageCreateInfo,
 };
-use vulkano::render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass, Subpass};
+use vulkano::render_pass::{
+    AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp, Framebuffer,
+    FramebufferCreateInfo, RenderPass, RenderPassCreateInfo, Subpass, SubpassDependency,
+    SubpassDescription,
+};
 use vulkano::shader::{EntryPoint, ShaderModule, ShaderModuleCreateInfo, ShaderStages};
 use vulkano::swapchain::{
     self, CompositeAlpha, PresentFuture, Surface, Swapchain, SwapchainAcquireFuture,
     SwapchainCreateInfo, SwapchainPresentInfo,
 };
 use vulkano::sync::future::{FenceSignalFuture, JoinFuture, NowFuture};
-use vulkano::sync::{self, GpuFuture};
+use vulkano::sync::{self, AccessFlags, GpuFuture, PipelineStages};
 use vulkano::{DeviceSize, Validated, Version, VulkanError};
 use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
@@ -91,9 +95,13 @@ const PREFILTERED_MAP_CONVOLUTION_SHADER_PATH: &str =
     "src/graphics/shaders/prefiltered_map_convolution_comp.spv";
 const BRDF_INTEGRATION_MAP_SHADER_PATH: &str = "src/graphics/shaders/brdf_integration_comp.spv";
 
-const FALLBACK_PIPELINE_NAME: &str = "Fallback";
+const POST_PROCESS_VERTEX_SHADER_PATH: &str = "src/graphics/shaders/post_process_vert.spv";
+
+const FALLBACK_MATERIAL_PIPELINE_NAME: &str = "Fallback";
 const FALLBACK_VERTEX_SHADER_PATH: &str = "src/graphics/shaders/base_vert.spv";
 const FALLBACK_FRAGMENT_SHADER_PATH: &str = "src/graphics/shaders/fallback_frag.spv";
+const FALLBACK_POST_PROCESS_SHADER_PATH: &str =
+    "src/graphics/shaders/post_process_fallback_frag.spv";
 
 const HDR_FORMAT: Format = Format::A2B10G10R10_UNORM_PACK32;
 const SDR_FORMAT: Format = Format::R8G8B8A8_SRGB;
@@ -144,6 +152,8 @@ struct EnvironmentTextureData
 /// Shader/material pipeline and texture assignments data
 struct MaterialPipelineData
 {
+    vert_shader_path: String, // Necessary for recreating pipeline when render pass changes
+    frag_shader_path: String, // Necessary for recreating pipeline when render pass changes
     graphics_pipeline: Arc<GraphicsPipeline>,
     lighting_mode: LightingMode,
     pbr_parameters_data: Option<PbrParametersData>,
@@ -154,7 +164,9 @@ struct MaterialPipelineData
 /// Post process pipeline and intermediate render target(s) descriptor set
 struct PostProcessPipelineData
 {
-    graphics_pipeline: Arc<GraphicsPipeline>,
+    shader_path: String, // Necessary for recreating pipeline when render pass changes
+    priority: u32,
+    graphics_pipeline: Option<Arc<GraphicsPipeline>>,
     attachments_image_views: Vec<SubpassAttachments>, // One set per swapchain image
     attachments_descriptor_sets: Vec<Arc<DescriptorSet>>, // One per swapchain image
 }
@@ -309,6 +321,8 @@ pub struct GfxApi
     swapchain: Arc<Swapchain>,
     viewport: Viewport,
     render_pass: Arc<RenderPass>,
+    should_recreate_render_pass: bool,
+    shader_entry_points: HashMap<String, EntryPoint>, // Used for recreating graphics pipelines
 
     // Unique name -> Material pipeline data
     material_pipeline_data: HashMap<String, MaterialPipelineData>,
@@ -471,11 +485,12 @@ impl GfxApi
         #[cfg(debug_assertions)]
         Self::log_depth_stencil_format(&depth_stencil_format);
 
-        // Create single pass render pass
-        let render_pass = vulkano::ordered_passes_renderpass!(
+        // Create single pass render pass by default (will be recreated later if
+        // post processes are added)
+        let render_pass = vulkano::single_pass_renderpass!(
             device.clone(),
             attachments: {
-                color_ldr: {
+                color: {
                     format: swapchain.image_format(),
                     samples: 1,
                     load_op: Clear,
@@ -487,25 +502,11 @@ impl GfxApi
                     load_op: Clear,
                     store_op: DontCare,
                 },
-                color_hdr: {
-                    format: HDR_FORMAT,
-                    samples: 1,
-                    load_op: Clear,
-                    store_op: DontCare,
-                },
             },
-            passes: [
-                {
-                    color: [color_hdr],
-                    depth_stencil: { depth_stencil },
-                    input: []
-                },
-                {
-                    color: [color_ldr],
-                    depth_stencil: {},
-                    input: [color_hdr]
-                }
-            ],
+            pass: {
+                color: [color],
+                depth_stencil: { depth_stencil },
+            },
         )
         .unwrap();
 
@@ -513,11 +514,19 @@ impl GfxApi
         let viewport = Viewport { extent: window.inner_size().into(), ..Default::default() };
 
         // Create fallback shaders' graphics pipeline
-        let vert_shader_entry_point =
-            Self::load_shader(device.clone(), FALLBACK_VERTEX_SHADER_PATH);
+        let mut shader_entry_points = HashMap::new();
 
-        let frag_shader_entry_point =
-            Self::load_shader(device.clone(), FALLBACK_FRAGMENT_SHADER_PATH);
+        let vert_shader_entry_point = Self::get_shader_entry_point(
+            &device,
+            FALLBACK_VERTEX_SHADER_PATH,
+            &mut shader_entry_points,
+        );
+
+        let frag_shader_entry_point = Self::get_shader_entry_point(
+            &device,
+            FALLBACK_FRAGMENT_SHADER_PATH,
+            &mut shader_entry_points,
+        );
 
         let fallback_graphics_pipeline = Self::create_material_graphics_pipeline(
             &device,
@@ -558,58 +567,11 @@ impl GfxApi
 
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
-        // Create default tonemapper's graphics pipeline and intermediate render targets
-        let post_process_vert_shader_entry_point =
-            Self::load_shader(device.clone(), "src/graphics/shaders/tonemapping_vert.spv");
-
-        let post_process_frag_shader_entry_point =
-            Self::load_shader(device.clone(), "src/graphics/shaders/tonemapping_frag.spv");
-
-        let tonemapper_graphics_pipeline = Self::create_post_process_graphics_pipeline(
-            &device,
-            &swapchain,
-            &render_pass,
-            post_process_vert_shader_entry_point,
-            post_process_frag_shader_entry_point,
-            1,
-        );
-
-        // Create one set of attachments per swapchain image
-        let mut tonemapper_attachments = Vec::new();
-        let mut tonemapper_descriptor_sets = Vec::new();
-
-        for image in &swapchain_images
-        {
-            let (tonemapper_image_views, tonemapper_descriptor_set) =
-                Self::create_post_process_attachments(
-                    memory_allocator.clone(),
-                    descriptor_set_allocator.clone(),
-                    tonemapper_graphics_pipeline.layout().set_layouts()[0].clone(),
-                    image.extent(),
-                    true,
-                );
-
-            tonemapper_attachments.push(tonemapper_image_views);
-            tonemapper_descriptor_sets.push(tonemapper_descriptor_set);
-        }
-
-        let tonemapper_pipeline_data = PostProcessPipelineData {
-            graphics_pipeline: tonemapper_graphics_pipeline,
-            attachments_image_views: tonemapper_attachments,
-            attachments_descriptor_sets: tonemapper_descriptor_sets,
-        };
-
-        let post_processing_pipelines = Vec::from([tonemapper_pipeline_data]);
-
-        // Create matching framebuffers for swapchain images
-        let tonemapper_subpass_attachments =
-            post_processing_pipelines.first().unwrap().attachments_image_views.clone();
-
         let framebuffers = Self::create_framebuffers(
             memory_allocator.clone(),
             &swapchain_images,
             &render_pass,
-            &Vec::from([tonemapper_subpass_attachments]),
+            &Vec::new(),
             depth_stencil_format,
         );
 
@@ -725,8 +687,10 @@ impl GfxApi
         // Register fallback pipeline data
         let mut pipeline_data = HashMap::new();
         pipeline_data.insert(
-            FALLBACK_PIPELINE_NAME.to_string(),
+            FALLBACK_MATERIAL_PIPELINE_NAME.to_string(),
             MaterialPipelineData {
+                vert_shader_path: String::from(FALLBACK_VERTEX_SHADER_PATH),
+                frag_shader_path: String::from(FALLBACK_FRAGMENT_SHADER_PATH),
                 graphics_pipeline: fallback_graphics_pipeline,
                 lighting_mode: LightingMode::Unlit,
                 pbr_parameters_data: None,
@@ -743,8 +707,11 @@ impl GfxApi
             swapchain,
             viewport,
             render_pass,
+            should_recreate_render_pass: false,
+
+            shader_entry_points,
             material_pipeline_data: pipeline_data,
-            post_processing_pipelines,
+            post_processing_pipelines: Vec::new(),
             cubemap_conversion_pipeline_data,
             irradiance_map_pipeline_data,
             prefiltered_map_pipeline_data,
@@ -2438,7 +2405,7 @@ impl GfxApi
         };
 
         let subpass = Subpass::from(render_pass.clone(), subpass_index).expect(
-            format!("Failed to create subpass for post process index {}", subpass_index).as_str(),
+            format!("Failed to create subpass for subpass index {}", subpass_index).as_str(),
         );
 
         let pipeline_stages = [
@@ -2459,14 +2426,14 @@ impl GfxApi
             ..DescriptorSetLayoutCreateInfo::default()
         };
 
-        let descriptor_set_layout =
-            DescriptorSetLayout::new(device.clone(), descriptor_set_layout_create_info).expect(
-                format!(
-                    "Failed to create descriptor set layout for post process index {}",
-                    subpass_index
-                )
+        let descriptor_set_layout = DescriptorSetLayout::new(
+            device.clone(),
+            descriptor_set_layout_create_info,
+        )
+        .expect(
+            format!("Failed to create descriptor set layout for subpass index {}", subpass_index)
                 .as_str(),
-            );
+        );
 
         let pipeline_layout_create_info = PipelineLayoutCreateInfo {
             set_layouts: Vec::from([descriptor_set_layout]),
@@ -2475,11 +2442,8 @@ impl GfxApi
 
         let pipeline_layout = PipelineLayout::new(device.clone(), pipeline_layout_create_info)
             .expect(
-                format!(
-                    "Failed to create pipeline layout for post process index {}",
-                    subpass_index
-                )
-                .as_str(),
+                format!("Failed to create pipeline layout for subpass index {}", subpass_index)
+                    .as_str(),
             );
 
         let graphics_pipeline_create_info = GraphicsPipelineCreateInfo {
@@ -2499,7 +2463,7 @@ impl GfxApi
 
         GraphicsPipeline::new(device.clone(), None, graphics_pipeline_create_info).expect(
             format!(
-                "Failed to create post processing graphics pipeline for subpass {}",
+                "Failed to create post processing graphics pipeline for subpass index {}",
                 subpass_index
             )
             .as_str(),
@@ -2601,7 +2565,7 @@ impl GfxApi
             for subpass_swapchain_copies in subpasses_attachments
             {
                 // Check that each subpass' attachments have one copy per swapchain image
-                if (subpass_swapchain_copies.len() != swapchain_images.len())
+                if subpass_swapchain_copies.len() != swapchain_images.len()
                 {
                     panic!(
                         "Subpass' attachments length does not match the number of swapchain images"
@@ -2667,6 +2631,30 @@ impl GfxApi
             )
     }
 
+    /// Load shader from file or retrieve entry point directly from cache.
+    /// Cache will be updated with new shader if loaded.
+    ///
+    /// # Panics
+    /// Will panic if `shader path` does not point to a valid shader file
+    fn get_shader_entry_point(
+        device: &Arc<Device>,
+        shader_path: &str,
+        cache: &mut HashMap<String, EntryPoint>,
+    ) -> EntryPoint
+    {
+        if cache.contains_key(shader_path)
+        {
+            cache.get(shader_path).unwrap().clone()
+        }
+        else
+        {
+            let entry_point = Self::load_shader(device.clone(), shader_path);
+            cache.insert(String::from(shader_path), entry_point.clone());
+
+            entry_point
+        }
+    }
+
     /// Load a shader from the given path
     ///
     /// # Panics
@@ -2675,6 +2663,9 @@ impl GfxApi
     {
         let filepath = Path::new(env!("CARGO_MANIFEST_DIR")).join(shader_path);
         let filepath_str = filepath.to_str().unwrap();
+
+        #[cfg(debug_assertions)]
+        println!("Attempting to load shader file: {filepath_str}");
 
         let mut bytes = Vec::new();
         let mut file =
@@ -2933,8 +2924,17 @@ impl GfxApi
     )
     {
         // Load shaders and initialize pipeline
-        let vert_shader_entry_point = Self::load_shader(self.device.clone(), vertex_shader_path);
-        let frag_shader_entry_point = Self::load_shader(self.device.clone(), fragment_shader_path);
+        let vert_shader_entry_point = Self::get_shader_entry_point(
+            &self.device,
+            vertex_shader_path,
+            &mut self.shader_entry_points,
+        );
+
+        let frag_shader_entry_point = Self::get_shader_entry_point(
+            &self.device,
+            fragment_shader_path,
+            &mut self.shader_entry_points,
+        );
 
         let graphics_pipeline = Self::create_material_graphics_pipeline(
             &self.device,
@@ -2999,6 +2999,8 @@ impl GfxApi
 
         // Add/update pipeline data (actual textures' data has to be set with init_textures)
         let pipeline_data = MaterialPipelineData {
+            vert_shader_path: String::from(vertex_shader_path),
+            frag_shader_path: String::from(fragment_shader_path),
             graphics_pipeline,
             lighting_mode,
             pbr_parameters_data,
@@ -3007,6 +3009,34 @@ impl GfxApi
         };
 
         self.material_pipeline_data.insert(material_name.clone(), pipeline_data);
+    }
+
+    /// Initialize a new post process subpass
+    /// # Panics
+    /// Will panic if any of the shader files is not found or corrupted
+    pub fn init_post_process(&mut self, shader_path: &str, priority: u32)
+    {
+        let pipeline_data = PostProcessPipelineData {
+            shader_path: String::from(shader_path),
+            priority,
+
+            // Will be created after render pass is recreated in "recreate_graphics_pipelines"
+            graphics_pipeline: None,
+
+            // These two will be initialized when recreating the framebuffer
+            // during "recreate_swapchain"
+            attachments_image_views: Vec::new(),
+            attachments_descriptor_sets: Vec::new(),
+        };
+
+        self.post_processing_pipelines.push(pipeline_data);
+        self.post_processing_pipelines.sort_by_key(|data| data.priority);
+
+        // Need to recreate render pass once all post processes are added in a single frame
+        self.should_recreate_render_pass = true;
+
+        // Need to recreate framebuffers since extra attachments will be needed
+        self.should_recreate_swapchain = true;
     }
 
     /// Initialize new textures for rendering (upload data to GPU)
@@ -3151,6 +3181,12 @@ impl GfxApi
     /// Record and execute rendering commands once the next frame image is ready
     pub fn render(&mut self)
     {
+        // Recreate render pass before rendering if it needs to change
+        if self.should_recreate_render_pass
+        {
+            self.recreate_render_pass();
+        }
+
         // If needed, recreate swapchain and framebuffers before rendering
         if self.should_recreate_swapchain
         {
@@ -3176,12 +3212,26 @@ impl GfxApi
         )
         .expect("Failed to create command buffer builder");
 
+        // Register clear values for all render pass' attachments
+        // (Color + depth + one per post process)
+        let render_pass_clear_values = {
+            let mut clear_values: Vec<Option<ClearValue>> =
+                Vec::with_capacity(2 + self.post_processing_pipelines.len());
+
+            clear_values.push(Some([0.1, 0.1, 0.1, 0.0].into())); // LDR Color
+            clear_values.push(Some((1.0, 0).into())); // Depth + stencil
+
+            // Add one HDR clear value per post process
+            for _ in 0..self.post_processing_pipelines.len()
+            {
+                clear_values.push(Some([0.0, 0.0, 0.0, 0.0].into()));
+            }
+
+            clear_values
+        };
+
         let render_pass_begin_info = RenderPassBeginInfo {
-            clear_values: Vec::from([
-                Some([0.1, 0.1, 0.1, 1.0].into()), // Color
-                Some((1.0, 0).into()),             // Depth + stencil
-                Some([0.0, 0.0, 0.0, 0.0].into()), // HRD Color
-            ]),
+            clear_values: render_pass_clear_values,
             ..RenderPassBeginInfo::framebuffer(self.framebuffers[image_index as usize].clone())
         };
 
@@ -3205,7 +3255,9 @@ impl GfxApi
 
                     Self::log_error(err_msg.as_str());
 
-                    self.material_pipeline_data.get(&FALLBACK_PIPELINE_NAME.to_string()).unwrap()
+                    self.material_pipeline_data
+                        .get(&FALLBACK_MATERIAL_PIPELINE_NAME.to_string())
+                        .unwrap()
                 }
                 else
                 {
@@ -3273,33 +3325,49 @@ impl GfxApi
         // Subpasses' draw commands (no need to bind vertex and index buffers
         // since the vertices are hard-coded in the vertex shader)
 
-        for (i, post_process) in self.post_processing_pipelines.iter().enumerate()
+        for (i, post_process_data) in self.post_processing_pipelines.iter().enumerate()
         {
-            command_buffer_builder
-                .next_subpass(SubpassEndInfo::default(), SubpassBeginInfo::default())
-                .expect(
-                    format!("Failed to move to post processing subpass index {}", i).as_str(),
-                )
-                .bind_pipeline_graphics(post_process.graphics_pipeline.clone())
-                .expect(
-                    format!("Failed to bind post processing pipeline for subpass {}", i).as_str(),
-                )
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    post_process.graphics_pipeline.layout().clone(),
-                    0,
-                    Vec::from([
-                        post_process.attachments_descriptor_sets[image_index as usize].clone()
-                    ]),
-                )
-                .expect(
-                    format!("Failed to bind post processing descriptor set for subpass {}", i)
+            if let Some(ref post_process_graphics_pipeline) = post_process_data.graphics_pipeline
+            {
+                command_buffer_builder
+                    .next_subpass(SubpassEndInfo::default(), SubpassBeginInfo::default())
+                    .expect(
+                        format!("Failed to move to post processing subpass index {}", i).as_str(),
+                    )
+                    .bind_pipeline_graphics(post_process_graphics_pipeline.clone())
+                    .expect(
+                        format!("Failed to bind post processing pipeline for subpass {}", i)
+                            .as_str(),
+                    )
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        post_process_graphics_pipeline.layout().clone(),
+                        0,
+                        Vec::from([post_process_data.attachments_descriptor_sets
+                            [image_index as usize]
+                            .clone()]),
+                    )
+                    .expect(
+                        format!("Failed to bind post processing descriptor set for subpass {}", i)
+                            .as_str(),
+                    );
+
+                unsafe { command_buffer_builder.draw(3, 1, 0, 0) }.expect(
+                    format!("Failed to register post processing draw call for subpass {}", i)
                         .as_str(),
                 );
-
-            unsafe { command_buffer_builder.draw(3, 1, 0, 0) }.expect(
-                format!("Failed to register post processing draw call for subpass {}", i).as_str(),
-            );
+            }
+            else
+            {
+                Self::log_error(
+                    format!(
+                        "Graphics pipeline for post process with shader {} is \"None\" \
+                        Skipping subpass.",
+                        post_process_data.shader_path,
+                    )
+                    .as_str(),
+                );
+            }
         }
 
         command_buffer_builder
@@ -3483,7 +3551,7 @@ impl GfxApi
         // so just use the fallback pipeline to retrieve the layout
         let graphics_pipeline = &self
             .material_pipeline_data
-            .get(FALLBACK_PIPELINE_NAME)
+            .get(FALLBACK_MATERIAL_PIPELINE_NAME)
             .expect("Failed retrieving the fallback graphics pipeline")
             .graphics_pipeline;
 
@@ -3622,7 +3690,7 @@ impl GfxApi
         // so just use the fallback pipeline to retrieve the layout
         let graphics_pipeline = &self
             .material_pipeline_data
-            .get(FALLBACK_PIPELINE_NAME)
+            .get(FALLBACK_MATERIAL_PIPELINE_NAME)
             .expect("Failed retrieving fallback graphics pipeline")
             .graphics_pipeline;
 
@@ -3642,6 +3710,257 @@ impl GfxApi
         .expect("Failed to update view projection data buffer");
     }
 
+    /// Recreate all material and post process graphics pipelines using the current render pass
+    fn recreate_graphics_pipelines(&mut self)
+    {
+        // Recreate material graphics pipelines
+        for (_, material_pipeline_data) in self.material_pipeline_data.iter_mut()
+        {
+            let vert_entry_point = Self::get_shader_entry_point(
+                &self.device,
+                &material_pipeline_data.vert_shader_path,
+                &mut self.shader_entry_points,
+            );
+
+            let frag_entry_point = Self::get_shader_entry_point(
+                &self.device,
+                &material_pipeline_data.frag_shader_path,
+                &mut self.shader_entry_points,
+            );
+
+            let new_pipeline = Self::create_material_graphics_pipeline(
+                &self.device,
+                &self.swapchain,
+                &self.render_pass,
+                vert_entry_point,
+                frag_entry_point,
+                material_pipeline_data.texture_assignments.len() as u32,
+                material_pipeline_data.lighting_mode,
+            );
+
+            material_pipeline_data.graphics_pipeline = new_pipeline;
+        }
+
+        // Recreate post process graphics pipelines
+        for (i, post_process_pipeline_data) in self.post_processing_pipelines.iter_mut().enumerate()
+        {
+            let vert_entry_point = Self::get_shader_entry_point(
+                &self.device,
+                POST_PROCESS_VERTEX_SHADER_PATH,
+                &mut self.shader_entry_points,
+            );
+
+            let frag_entry_point = Self::get_shader_entry_point(
+                &self.device,
+                &post_process_pipeline_data.shader_path,
+                &mut self.shader_entry_points,
+            );
+
+            let new_pipeline = Self::create_post_process_graphics_pipeline(
+                &self.device,
+                &self.swapchain,
+                &self.render_pass,
+                vert_entry_point,
+                frag_entry_point,
+                (i + 1) as u32, // Post process subpasses start from index 1
+            );
+
+            post_process_pipeline_data.graphics_pipeline = Some(new_pipeline);
+        }
+    }
+
+    /// Recreate render pass using the currently registered post processes' pipeline data
+    /// All graphics pipelines will be recreated after the render pass
+    fn recreate_render_pass(&mut self)
+    {
+        // Register default LDR color and depth-stencil attachments
+        let color_ldr_attachment = AttachmentDescription {
+            format: self.swapchain.image_format(),
+            load_op: AttachmentLoadOp::Clear,
+            store_op: AttachmentStoreOp::Store,
+            // Transition to "PresentSrc" seems to be handled automatically by vulkano
+            final_layout: ImageLayout::ColorAttachmentOptimal,
+            ..AttachmentDescription::default()
+        };
+
+        let depth_stencil_attachment = AttachmentDescription {
+            format: self.depth_stencil_format,
+            load_op: AttachmentLoadOp::Clear,
+            final_layout: ImageLayout::DepthStencilAttachmentOptimal,
+            ..AttachmentDescription::default()
+        };
+
+        let mut attachments = Vec::from([color_ldr_attachment.clone(), depth_stencil_attachment]);
+
+        let color_ldr_attachment_ref = AttachmentReference {
+            attachment: 0,
+            layout: ImageLayout::ColorAttachmentOptimal,
+            ..AttachmentReference::default()
+        };
+
+        let depth_stencil_attachment_ref = AttachmentReference {
+            attachment: 1,
+            layout: ImageLayout::DepthStencilAttachmentOptimal,
+            ..AttachmentReference::default()
+        };
+
+        // Register subpasses and dependencies (if any)
+        let (subpasses, dependencies) = {
+            let mut subpass_descriptions = Vec::new();
+            let mut dependencies = Vec::new();
+
+            // If no post processes are registered, then LDR color + depth will be used
+            // as the only subpass. Otherwise, LDR color will be the final subpass without depth
+            let post_process_num = self.post_processing_pipelines.len();
+            if post_process_num == 0
+            {
+                let single_subpass = SubpassDescription {
+                    color_attachments: Vec::from([Some(color_ldr_attachment_ref.clone())]),
+                    depth_stencil_attachment: Some(depth_stencil_attachment_ref),
+                    ..SubpassDescription::default()
+                };
+
+                subpass_descriptions.push(single_subpass)
+            }
+            else
+            {
+                // Initial HDR color + depth stencil subpass
+                let color_hdr_attachment = AttachmentDescription {
+                    format: HDR_FORMAT,
+                    load_op: AttachmentLoadOp::Clear,
+                    final_layout: ImageLayout::ColorAttachmentOptimal,
+                    ..AttachmentDescription::default()
+                };
+
+                attachments.push(color_hdr_attachment.clone());
+
+                let color_hdr_attachment_ref = AttachmentReference {
+                    attachment: (attachments.len() - 1) as u32,
+                    layout: ImageLayout::ColorAttachmentOptimal,
+                    ..AttachmentReference::default()
+                };
+
+                let first_subpass = SubpassDescription {
+                    color_attachments: Vec::from([Some(color_hdr_attachment_ref.clone())]),
+                    depth_stencil_attachment: Some(depth_stencil_attachment_ref),
+                    ..SubpassDescription::default()
+                };
+
+                subpass_descriptions.push(first_subpass);
+
+                // If there are more than one post process, then need to create an extra
+                // output HDR color attachment
+                if post_process_num > 1
+                {
+                    attachments.push(color_hdr_attachment.clone());
+                }
+
+                // Add each post process subpass
+                let mut next_output_attachment_index = 3;
+
+                for i in 0..post_process_num
+                {
+                    // Last post process outputs to the LDR color attachment
+                    // All others output to the intermediate HDR color attachments (alternated
+                    // between subpasses)
+                    let post_process_color_attachment_index = {
+                        if i == post_process_num - 1 { 0 } else { next_output_attachment_index }
+                    };
+
+                    let post_process_color_attachment_ref = AttachmentReference {
+                        attachment: post_process_color_attachment_index,
+                        layout: ImageLayout::ColorAttachmentOptimal,
+                        ..AttachmentReference::default()
+                    };
+
+                    let post_process_input_attachment_ref = AttachmentReference {
+                        attachment: if next_output_attachment_index == 3 { 2 } else { 3 },
+                        layout: ImageLayout::ShaderReadOnlyOptimal,
+                        ..AttachmentReference::default()
+                    };
+
+                    let post_process_subpass = SubpassDescription {
+                        color_attachments: Vec::from([Some(post_process_color_attachment_ref)]),
+                        input_attachments: Vec::from([Some(post_process_input_attachment_ref)]),
+                        ..SubpassDescription::default()
+                    };
+
+                    let subpass_dependency = SubpassDependency {
+                        src_subpass: Some(i as u32),
+                        dst_subpass: Some((i + 1) as u32),
+                        src_stages: PipelineStages::COLOR_ATTACHMENT_OUTPUT,
+                        dst_stages: PipelineStages::FRAGMENT_SHADER,
+                        src_access: AccessFlags::COLOR_ATTACHMENT_READ,
+                        dst_access: AccessFlags::SHADER_WRITE,
+                        ..SubpassDependency::default()
+                    };
+
+                    subpass_descriptions.push(post_process_subpass);
+                    dependencies.push(subpass_dependency);
+
+                    // Alternate HDR color attachments between input and output
+                    next_output_attachment_index =
+                        if next_output_attachment_index == 3 { 2 } else { 3 };
+                }
+            }
+
+            (subpass_descriptions, dependencies)
+        };
+
+        let render_pass_create_info = RenderPassCreateInfo {
+            attachments,
+            subpasses,
+            dependencies,
+            ..RenderPassCreateInfo::default()
+        };
+
+        self.render_pass = RenderPass::new(self.device.clone(), render_pass_create_info)
+            .expect("Failed to recreate render pass");
+
+        self.recreate_graphics_pipelines();
+    }
+
+    /// Recreate all registered post processes' attachments and descriptor sets
+    /// using the current swapchain image extents
+    fn recreate_post_process_attachments(&mut self)
+    {
+        for pipeline_data in self.post_processing_pipelines.iter_mut()
+        {
+            if let Some(ref graphics_pipeline) = pipeline_data.graphics_pipeline
+            {
+                // Create one set of attachments per swapchain image
+                pipeline_data.attachments_image_views = Vec::new();
+                pipeline_data.attachments_descriptor_sets = Vec::new();
+
+                let image_extent = self.swapchain.image_extent();
+                for _ in 0..self.swapchain.image_count()
+                {
+                    let (image_views, descriptor_set) = Self::create_post_process_attachments(
+                        self.memory_allocator.clone(),
+                        self.descriptor_set_allocator.clone(),
+                        graphics_pipeline.layout().set_layouts()[0].clone(),
+                        [image_extent[0], image_extent[1], 1],
+                        true,
+                    );
+
+                    pipeline_data.attachments_image_views.push(image_views);
+                    pipeline_data.attachments_descriptor_sets.push(descriptor_set);
+                }
+            }
+            else
+            {
+                Self::log_error(
+                    format!(
+                        "Graphics pipeline for post process with shader {} is \"None\".\
+                        Unable to create post process attachments.",
+                        pipeline_data.shader_path,
+                    )
+                    .as_str(),
+                );
+            }
+        }
+    }
+
     /// Recreate swapchain to match new surface's properties
     fn recreate_swapchain(&mut self)
     {
@@ -3654,7 +3973,10 @@ impl GfxApi
 
         self.swapchain = new_swapchain;
 
-        // Gather all subpasses attachments for framebuffers
+        // Recreate all post process attachments (to match new swapchain size)
+        // then gather all subpasses attachments for framebuffers
+        self.recreate_post_process_attachments();
+
         let mut subpasses_attachments = Vec::new();
         for post_process in &self.post_processing_pipelines
         {
