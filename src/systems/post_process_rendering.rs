@@ -41,6 +41,16 @@ impl System for PostProcessRenderingSystem
 
                 post_process_mut.has_been_initialized = true;
             }
+            
+            if post_process_mut.was_updated
+            {
+                gfx_api_ref.update_post_process_parameters(
+                    post_process_mut.shader_path.as_str(),
+                    post_process_mut.strength,
+                );
+
+                post_process_mut.was_updated = false;
+            }
         }
     }
 }

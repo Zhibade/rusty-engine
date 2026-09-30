@@ -8,6 +8,12 @@ layout(input_attachment_index = 0, set = 0, binding = 0) uniform subpassInput s_
 // Output SDR color
 layout(location = 0) out vec4 f_color;
 
+// Post process extra parameters (not used in this shader, but added as reference for future post processes)
+layout(push_constant) uniform PostProcessShaderData
+{
+    float strength;
+} parameters;
+
 void main()
 {
     // Tonemapping + Gamma correction

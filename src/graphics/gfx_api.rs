@@ -165,6 +165,7 @@ struct MaterialPipelineData
 struct PostProcessPipelineData
 {
     shader_path: String, // Necessary for recreating pipeline when render pass changes
+    shader_data: PostProcessShaderData,
     priority: u32,
     graphics_pipeline: Option<Arc<GraphicsPipeline>>,
     attachments_image_views: Vec<SubpassAttachments>, // One set per swapchain image
@@ -304,6 +305,14 @@ impl Default for PbrParametersBufferData
 struct FragmentShaderExtraDataContents
 {
     view_dir: [f32; 3],
+}
+
+/// Post process shader data (used as a push constant)
+#[derive(BufferContents, Clone, Default)]
+#[repr(C)]
+struct PostProcessShaderData
+{
+    strength: f32,
 }
 
 // ------
@@ -2435,7 +2444,15 @@ impl GfxApi
                 .as_str(),
         );
 
+        // Create push constant ranges (post process extra shader data)
+        let push_constant_range = PushConstantRange {
+            stages: ShaderStages::FRAGMENT,
+            offset: 0,
+            size: size_of::<PostProcessShaderData>() as u32,
+        };
+
         let pipeline_layout_create_info = PipelineLayoutCreateInfo {
+            push_constant_ranges: Vec::from([push_constant_range]),
             set_layouts: Vec::from([descriptor_set_layout]),
             ..PipelineLayoutCreateInfo::default()
         };
@@ -3012,13 +3029,28 @@ impl GfxApi
     }
 
     /// Initialize a new post process subpass
+    /// If a post process with the `shader_path` has been already initialized, call will be ignored
     /// # Panics
     /// Will panic if any of the shader files is not found or corrupted
     pub fn init_post_process(&mut self, shader_path: &str, priority: u32)
     {
+        // Check if shader has already been registered
+        if self.post_processing_pipelines.iter().any(|data| data.shader_path == shader_path)
+        {
+            let message = format!(
+                "A post process with shader path: {} \
+                has already been registered. Ignoring call",
+                shader_path
+            );
+            Self::log_error(message.as_str());
+            return;
+        }
+
+        // Register post process
         let pipeline_data = PostProcessPipelineData {
             shader_path: String::from(shader_path),
             priority,
+            shader_data: PostProcessShaderData::default(),
 
             // Will be created after render pass is recreated in "recreate_graphics_pipelines"
             graphics_pipeline: None,
@@ -3350,7 +3382,13 @@ impl GfxApi
                     .expect(
                         format!("Failed to bind post processing descriptor set for subpass {}", i)
                             .as_str(),
-                    );
+                    )
+                    .push_constants(
+                        post_process_graphics_pipeline.layout().clone(),
+                        0,
+                        post_process_data.shader_data.clone(),
+                    )
+                    .expect(format!("Failed to bind push constants for subpass {}", i).as_str());
 
                 unsafe { command_buffer_builder.draw(3, 1, 0, 0) }.expect(
                     format!("Failed to register post processing draw call for subpass {}", i)
@@ -3524,6 +3562,19 @@ impl GfxApi
 
                 Self::log_error(err_msg.as_str());
             }
+        }
+    }
+
+    /// Update post process parameters
+    /// Call will be ignored if post process has not been registered
+    pub fn update_post_process_parameters(&mut self, shader_path: &str, strength: f32)
+    {
+        let post_process_data_option =
+            self.post_processing_pipelines.iter_mut().find(|data| data.shader_path == shader_path);
+
+        if let Some(post_process_data) = post_process_data_option
+        {
+            post_process_data.shader_data.strength = strength;
         }
     }
 

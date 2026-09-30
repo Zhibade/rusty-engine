@@ -28,7 +28,7 @@ impl Default for PostProcess
             shader_path: String::new(),
             strength: 1.0,
             priority: 0,
-            was_updated: false,
+            was_updated: true,
             has_been_initialized: false
         }
     }
