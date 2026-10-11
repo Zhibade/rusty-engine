@@ -1,0 +1,7 @@
+# Increase stack size on Windows' toolchains to prevent stack overflow when vulkano parses shader files
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:4194304"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-Wl,--stack,4194304"]
