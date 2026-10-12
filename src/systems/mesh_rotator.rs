@@ -17,13 +17,17 @@ impl System for MeshRotatorSystem
 {
     fn update(&self, delta_time: f32, world: &World)
     {
+        let angle_rad = (self.speed * delta_time).to_radians();
+
         for (_, transform) in world.query_pair::<Mesh, Transform>()
         {
-            let angle_rad = (self.speed * delta_time).to_radians();
-
             let mut transform_mut = transform.borrow_mut();
-            transform_mut.matrix *= Mat4::from_rotation_y(angle_rad);
-            transform_mut.has_been_changed = true;
+
+            if !transform_mut.is_static
+            {
+                transform_mut.matrix *= Mat4::from_rotation_y(angle_rad);
+                transform_mut.has_been_changed = true;
+            }
         }
     }
 }

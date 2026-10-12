@@ -87,10 +87,15 @@ impl App
             ..Material::default()
         };
 
+        let skybox_transform = Transform {
+            is_static: true,
+            ..Transform::from_scale(Vec3::new(99.0, 99.0, 99.0))
+        };
+
         let skybox_id = world.add_entity();
         world.add_component(skybox_id, skybox_mesh);
         world.add_component(skybox_id, skybox_material);
-        world.add_component(skybox_id, Transform::from_scale(Vec3::new(99.0, 99.0, 99.0)));
+        world.add_component(skybox_id, skybox_transform);
 
         // Add environment lighting
         let env_light_component = ImageBasedLight {
