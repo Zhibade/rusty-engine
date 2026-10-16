@@ -186,9 +186,9 @@ struct RenderMeshData
 {
     vertex_buffer: Subbuffer<[VertexData]>,
     index_buffer: Subbuffer<[u32]>,
-    transform_data: ObjectTransformData,
 
-    pipeline_data_id: String, // TODO: Might be better to use indexes/GUID?
+    // TODO: Might be better to use indexes/GUID instead of material name?
+    transform_data_per_pipeline_id: HashMap<String, Vec<ObjectTransformData>>,
 }
 
 /// Texture data after uploading to the GPU
@@ -2895,37 +2895,63 @@ impl GfxApi
     }
 
     /// Initialize a new mesh for rendering (upload data to GPU)
+    /// Instance ID for that mesh and material combination will be returned
     pub fn init_mesh(
         &mut self,
         mesh: &Mesh,
         transform_matrix: [[f32; 4]; 4],
         material_name: &String,
-    )
+    ) -> u32
     {
-        // Check first if mesh isn't already loaded
-        // TODO: Add support for multiple instances of same mesh
+        // If mesh is already loaded just add transform to its corresponding material ID
         if self.render_meshes_data.contains_key(&mesh.filepath)
         {
-            return;
+            let object_transform_data = ObjectTransformData { matrix: transform_matrix };
+            let render_mesh_data = self.render_meshes_data.get_mut(&mesh.filepath).unwrap();
+
+            // Add transform only if material is already registered
+            if let Some(transforms_data) =
+                render_mesh_data.transform_data_per_pipeline_id.get_mut(material_name)
+            {
+                transforms_data.push(object_transform_data);
+                (transforms_data.len() - 1) as u32
+            }
+            else
+            {
+                let transforms_data = Vec::from([object_transform_data]);
+
+                render_mesh_data.transform_data_per_pipeline_id.insert(
+                    material_name.clone(),
+                    transforms_data
+                );
+
+                0 // Return 0 since it is the first instance using this material
+            }
         }
+        else
+        {
+            // Allocate buffers
+            let (vertex_buffer, index_buffer) = Self::allocate_vertex_data_buffers(
+                self.memory_allocator.clone(),
+                self.command_buffer_allocator.clone(),
+                self.graphics_queue.clone(),
+                mesh,
+            );
 
-        // Allocate buffers
-        let (vertex_buffer, index_buffer) = Self::allocate_vertex_data_buffers(
-            self.memory_allocator.clone(),
-            self.command_buffer_allocator.clone(),
-            self.graphics_queue.clone(),
-            mesh,
-        );
 
-        let transform_data = ObjectTransformData { matrix: transform_matrix };
-        let render_mesh_data = RenderMeshData {
-            vertex_buffer,
-            index_buffer,
-            transform_data,
-            pipeline_data_id: material_name.clone(),
-        };
+            let transform_data = ObjectTransformData { matrix: transform_matrix };
+            let render_mesh_data = RenderMeshData {
+                vertex_buffer,
+                index_buffer,
+                transform_data_per_pipeline_id: HashMap::from(
+                    [(material_name.clone(), Vec::from([transform_data]))]
+                ),
+            };
 
-        self.render_meshes_data.insert(mesh.filepath.clone(), render_mesh_data);
+            self.render_meshes_data.insert(mesh.filepath.clone(), render_mesh_data);
+
+            0 // Return 0 since it is the first instance
+        }
     }
 
     /// Initialize vertex and fragment shaders pair (meant for 3D object materials)
@@ -3276,82 +3302,98 @@ impl GfxApi
         // Draw each mesh
         for (_, mesh_data) in self.render_meshes_data.iter()
         {
-            // Get corresponding graphics pipeline data and textures descriptor set
-            let pipeline_data = {
-                if !self.material_pipeline_data.contains_key(&mesh_data.pipeline_data_id)
-                {
-                    let err_msg = format!(
-                        "render :: Pipeline data for [{}] not found. Using fallback pipeline/shaders",
-                        &mesh_data.pipeline_data_id
-                    );
-
-                    Self::log_error(err_msg.as_str());
-
-                    self.material_pipeline_data
-                        .get(&FALLBACK_MATERIAL_PIPELINE_NAME.to_string())
-                        .unwrap()
-                }
-                else
-                {
-                    self.material_pipeline_data.get(&mesh_data.pipeline_data_id).unwrap()
-                }
-            };
-
-            let mut descriptor_sets = vec![
-                self.view_projection_data_descriptor_set.clone(),
-                self.fragment_shader_extra_data.descriptor_set.clone(),
-            ];
-
-            // Add textures' descriptor set if it exists
-            if let Some(ref textures_descriptor_set) = pipeline_data.textures_descriptor_set
+            for (pipeline_id, transforms_data) in mesh_data.transform_data_per_pipeline_id.iter()
             {
-                descriptor_sets.push(textures_descriptor_set.clone());
-            }
-
-            // Add lighting descriptor set if it uses lighting
-            if pipeline_data.lighting_mode == LightingMode::Lit
-                || pipeline_data.lighting_mode == LightingMode::PBR
-            {
-                descriptor_sets.push(self.environment_map_descriptor_set.clone());
-
-                // Add PBR parameters descriptor set if PBR
-                if pipeline_data.lighting_mode == LightingMode::PBR
-                {
-                    if let Some(ref pbr_parameter) = pipeline_data.pbr_parameters_data
+                // Get corresponding graphics pipeline data and textures descriptor set
+                let pipeline_data = {
+                    if !self.material_pipeline_data.contains_key(pipeline_id)
                     {
-                        descriptor_sets.push(pbr_parameter.pbr_parameters_descriptor_set.clone());
+                        let err_msg = format!(
+                            "render :: Pipeline data for [{pipeline_id}] not found.\
+                            Using fallback pipeline/shaders",
+                        );
+
+                        Self::log_error(err_msg.as_str());
+
+                        self.material_pipeline_data
+                            .get(&FALLBACK_MATERIAL_PIPELINE_NAME.to_string())
+                            .unwrap()
+                    }
+                    else
+                    {
+                        self.material_pipeline_data.get(pipeline_id).unwrap()
+                    }
+                };
+
+                let mut descriptor_sets = vec![
+                    self.view_projection_data_descriptor_set.clone(),
+                    self.fragment_shader_extra_data.descriptor_set.clone(),
+                ];
+
+                // Add textures' descriptor set if it exists
+                if let Some(ref textures_descriptor_set) = pipeline_data.textures_descriptor_set
+                {
+                    descriptor_sets.push(textures_descriptor_set.clone());
+                }
+
+                // Add lighting descriptor set if it uses lighting
+                if pipeline_data.lighting_mode == LightingMode::Lit
+                    || pipeline_data.lighting_mode == LightingMode::PBR
+                {
+                    descriptor_sets.push(self.environment_map_descriptor_set.clone());
+
+                    // Add PBR parameters descriptor set if PBR
+                    if pipeline_data.lighting_mode == LightingMode::PBR
+                    {
+                        if let Some(ref pbr_parameter) = pipeline_data.pbr_parameters_data
+                        {
+                            descriptor_sets
+                                .push(pbr_parameter.pbr_parameters_descriptor_set.clone());
+                        }
                     }
                 }
+
+                let id = pipeline_id;
+
+                // Mesh draw commands
+                command_buffer_builder
+                    .bind_pipeline_graphics(pipeline_data.graphics_pipeline.clone())
+                    .expect(format!("Failed to bind pipeline for {}", id).as_str())
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        pipeline_data.graphics_pipeline.layout().clone(),
+                        0,
+                        descriptor_sets,
+                    )
+                    .expect(format!("Failed to bind descriptor sets for {}", id).as_str())
+                    .bind_vertex_buffers(0, mesh_data.vertex_buffer.clone())
+                    .expect(format!("Failed to bind vertex buffer for {}", id).as_str())
+                    .bind_index_buffer(mesh_data.index_buffer.clone())
+                    .expect(format!("Failed to bind index buffer for {}", id).as_str());
+
+                // Draw one mesh per transform
+                // TODO: Support instanced drawing
+                for (i, transform_data) in transforms_data.iter().enumerate()
+                {
+                    command_buffer_builder.push_constants(
+                        pipeline_data.graphics_pipeline.layout().clone(),
+                        0,
+                        transform_data.clone(),
+                    )
+                    .expect(
+                        format!("Failed to set push constants for {id} - Instance {i}").as_str()
+                    );
+
+                    unsafe
+                    {
+                        command_buffer_builder
+                            .draw_indexed(mesh_data.index_buffer.len() as u32, 1, 0, 0, 0)
+                    }
+                    .expect(
+                        format!("Failed to register draw call for {id} - Instance {i}").as_str()
+                    );
+                }
             }
-
-            let id = &mesh_data.pipeline_data_id;
-
-            // Mesh draw commands
-            command_buffer_builder
-                .bind_pipeline_graphics(pipeline_data.graphics_pipeline.clone())
-                .expect(format!("Failed to bind pipeline for {}", id).as_str())
-                .bind_descriptor_sets(
-                    PipelineBindPoint::Graphics,
-                    pipeline_data.graphics_pipeline.layout().clone(),
-                    0,
-                    descriptor_sets,
-                )
-                .expect(format!("Failed to bind descriptor sets for {}", id).as_str())
-                .bind_vertex_buffers(0, mesh_data.vertex_buffer.clone())
-                .expect(format!("Failed to bind vertex buffer for {}", id).as_str())
-                .bind_index_buffer(mesh_data.index_buffer.clone())
-                .expect(format!("Failed to bind index buffer for {}", id).as_str())
-                .push_constants(
-                    pipeline_data.graphics_pipeline.layout().clone(),
-                    0,
-                    mesh_data.transform_data.clone(),
-                )
-                .expect(format!("Failed to set push constants for {}", id).as_str());
-
-            unsafe {
-                command_buffer_builder.draw_indexed(mesh_data.index_buffer.len() as u32, 1, 0, 0, 0)
-            }
-            .expect(format!("Failed to register draw call for {}", id).as_str());
         }
 
         // Subpasses' draw commands (no need to bind vertex and index buffers
@@ -3499,11 +3541,43 @@ impl GfxApi
     /// Update specific mesh's transform
     ///
     /// Call will be ignored if mesh has not been initialized via [init_mesh](GfxApi::init_mesh)
-    pub fn update_mesh_transform(&mut self, filepath: &String, new_matrix: [[f32; 4]; 4])
+    /// or if the instance ID is invalid
+    pub fn update_mesh_transform(
+        &mut self,
+        filepath: &String,
+        material_name: &String,
+        instance_id: u32,
+        new_matrix: [[f32; 4]; 4],
+    )
     {
-        if self.render_meshes_data.contains_key(filepath)
+        if let Some(render_data) = self.render_meshes_data.get_mut(filepath)
         {
-            self.render_meshes_data.get_mut(filepath).unwrap().transform_data.matrix = new_matrix;
+            if let Some(transform_data) =
+                render_data.transform_data_per_pipeline_id.get_mut(material_name)
+            {
+                if instance_id < transform_data.len() as u32
+                {
+                    transform_data[instance_id as usize].matrix = new_matrix;
+                }
+                else
+                {
+                    let err_msg = format!(
+                        "update_mesh_transform :: Mesh: {filepath} :: Material: {material_name}\
+                        Instance ID {instance_id} is invalid. Ignoring call."
+                    );
+
+                    Self::log_error(err_msg.as_str());
+                }
+            }
+            else
+            {
+                let err_msg = format!(
+                    "update_mesh_transform :: Mesh: {filepath} ::\
+                    Material: {material_name} is invalid. Ignoring call."
+                );
+
+                Self::log_error(err_msg.as_str());
+            }
         }
         else
         {

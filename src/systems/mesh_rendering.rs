@@ -49,7 +49,7 @@ impl System for MeshRenderingSystem
             // Otherwise just update transform if there have been changes
             if !mesh.has_been_initialized
             {
-                gfx_api_ref.init_mesh(
+                mesh.instance_id = gfx_api_ref.init_mesh(
                     mesh.deref(),
                     transform.matrix.to_cols_array_2d(),
                     &material.name,
@@ -58,8 +58,12 @@ impl System for MeshRenderingSystem
             }
             else if transform.has_been_changed
             {
-                gfx_api_ref
-                    .update_mesh_transform(&mesh.filepath, transform.matrix.to_cols_array_2d());
+                gfx_api_ref.update_mesh_transform(
+                    &mesh.filepath,
+                    &material.name,
+                    mesh.instance_id,
+                    transform.matrix.to_cols_array_2d(),
+                );
             }
         }
     }

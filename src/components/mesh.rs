@@ -14,6 +14,7 @@ pub struct Mesh
     // TODO: Multiple material support for one mesh/entity
     pub filepath: String,
     pub has_been_initialized: bool, // Indicates if mesh data has been uploaded to the GPU or not
+    pub instance_id: u32, // Will be initialized by the system(s), no need to set it manually
 
     pub vertices: Vec<Vec3>,
     pub indices: Vec<u32>,
