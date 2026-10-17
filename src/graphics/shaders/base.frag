@@ -8,9 +8,10 @@
 layout(location = 0) in vec3 v_color;
 layout(location = 1) in vec2 v_uv0;
 layout(location = 2) in vec2 v_uv1;
+layout(location = 3) in vec3 v_world_pos;
 // Tangent + bitangent + normal matrix for normal mapping
 // Matrices take several locations, so it is better to have it at the end to avoid having to manually adjust them
-layout(location = 3) in mat3 v_tbn_matrix;
+layout(location = 4) in mat3 v_tbn_matrix;
 
 // Output fragment data
 layout(location = 0) out vec4 f_color;
@@ -18,7 +19,7 @@ layout(location = 0) out vec4 f_color;
 // Shared extra data
 layout(set = 1, binding = 0) uniform FragmentShaderExtraDataContents
 {
-    vec3 view_dir;
+    vec3 camera_pos;
 } extra_data;
 
 // Texture samplers
@@ -55,7 +56,8 @@ void main()
     // --------------------------
     // -- Image-based lighting --
     // --------------------------
-    float NdotV = max(dot(normal, -extra_data.view_dir), 0);
+    vec3 view_dir = normalize(extra_data.camera_pos - v_world_pos);
+    float NdotV = max(dot(normal, view_dir), 0);
 
     // specularContribution and diffuseContribution are also commonly known as kS and kD
     vec3 specularContribution = fresnelSchlick(NdotV, reflectivity, roughness);
@@ -66,7 +68,7 @@ void main()
     vec3 ibl_albedo = exposure * irradiance * albedo * diffuseContribution;
 
     // Specular/reflections
-    vec3 reflectionVector = reflect(extra_data.view_dir, normal);
+    vec3 reflectionVector = reflect(-view_dir, normal);
 
     int prefilteredMapMipmapCount = textureQueryLevels(prefilteredMap);
     vec3 reflection = textureLod(prefilteredMap, reflectionVector, roughness * prefilteredMapMipmapCount).rgb;

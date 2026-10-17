@@ -57,7 +57,12 @@ impl System for CameraRenderingSystem
                     [0.01, 100.0],
                 );
 
-                gfx_api_mut.update_camera(view_matrix, projection_matrix);
+                gfx_api_mut.update_camera(
+                    transform_ref.matrix.to_scale_rotation_translation().2.to_array(),
+                    view_matrix,
+                    projection_matrix,
+                );
+
                 found_active = true;
             }
         }

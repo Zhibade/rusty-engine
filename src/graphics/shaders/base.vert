@@ -14,9 +14,10 @@ layout(location = 5) in vec3 color;
 layout(location = 0) out vec3 v_color;
 layout(location = 1) out vec2 v_uv0;
 layout(location = 2) out vec2 v_uv1;
+layout(location = 3) out vec3 v_world_pos;
 // Tangent + bitangent + normal matrix for normal mapping
 // Matrices take several locations, so it is better to have it at the end to avoid having to manually adjust them
-layout(location = 3) out mat3 v_tbn_matrix;
+layout(location = 4) out mat3 v_tbn_matrix;
 
 // View and perspective projection matrices as a uniform buffer
 layout(binding = 0) uniform ViewPerspectiveData
@@ -34,8 +35,11 @@ layout(push_constant) uniform ObjectTransformData
 void main()
 {
     // Transform vertex position to match object's transform + camera transform + perspective
+    vec4 world_pos = object_transform_data.matrix * vec4(position, 1.0);
     mat4 view_perspective_matrix = view_perspective_data.perspective_matrix * view_perspective_data.view_matrix;
-    gl_Position = view_perspective_matrix * object_transform_data.matrix * vec4(position, 1.0);
+
+    gl_Position = view_perspective_matrix * world_pos;
+    v_world_pos = world_pos.xyz;
 
     // Transform normal and tangent, then calculate bitangent for normal mapping
     // Can't transform directly with object's transform matrix because non-uniform scale would cause normals to be wrong

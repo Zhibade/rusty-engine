@@ -304,7 +304,7 @@ impl Default for PbrParametersBufferData
 #[repr(C)]
 struct FragmentShaderExtraDataContents
 {
-    view_dir: [f32; 3],
+    camera_pos: [f32; 3],
 }
 
 /// Post process shader data (used as a push constant)
@@ -666,7 +666,7 @@ impl GfxApi
 
         // Allocate extra fragment shader shared data
         let fragment_shader_extra_data = {
-            let data = FragmentShaderExtraDataContents { view_dir: [0.0, 0.0, 1.0] };
+            let data = FragmentShaderExtraDataContents { camera_pos: [0.0, 0.0, 0.0] };
 
             let buffer = Self::allocate_data_buffer(memory_allocator.clone(), data.clone());
 
@@ -3508,7 +3508,12 @@ impl GfxApi
     }
 
     /// Update current view-perspective matrices for rendering
-    pub fn update_camera(&mut self, view_matrix: [[f32; 4]; 4], perspective_matrix: [[f32; 4]; 4])
+    pub fn update_camera(
+        &mut self,
+        camera_position: [f32; 3],
+        view_matrix: [[f32; 4]; 4],
+        perspective_matrix: [[f32; 4]; 4],
+    )
     {
         // Need to flip Y axis of projection matrix to match Vulkan's viewport coordinates
         // (glam library calculates a perspective matrix meant for OpenGL)
@@ -3518,11 +3523,7 @@ impl GfxApi
         self.view_projection_data =
             ViewProjectionData { view_matrix, perspective_matrix: flipped_perspective_matrix };
 
-        // Update camera view direction
-        let view_z_axis = &view_matrix[2];
-        self.fragment_shader_extra_data.data.view_dir =
-            [view_z_axis[0], view_z_axis[1], view_z_axis[2]];
-
+        self.fragment_shader_extra_data.data.camera_pos = camera_position;
         self.fragment_shader_extra_data.updated = true;
     }
 
