@@ -77,7 +77,7 @@ pub struct Texture
 
 impl Texture
 {
-    /// Get default black color texture
+    /// Get default white color texture
     pub fn default_color() -> Texture
     {
         Texture {

@@ -2,7 +2,7 @@
 
 use crate::components::camera::Camera;
 use crate::components::image_based_light::ImageBasedLight;
-use crate::components::material::{LightingMode, Material, Texture, TextureUsage};
+use crate::components::material::{LightingMode, Material, PbrParameters, Texture, TextureUsage};
 use crate::components::post_process::PostProcess;
 use crate::components::transform::Transform;
 use crate::core::world::World;
@@ -47,20 +47,19 @@ impl App
         world.add_component(camera_id, camera_transform);
 
         // Add mesh entity with material
-        let mesh = mesh_loader::load_mesh("assets/models/test_sphere.gltf");
-
-        let mesh_color_tex = Texture {
-            filepath: String::from("assets/textures/uv_checker.png"),
-            is_cubemap: false,
-            usage: TextureUsage::Color,
-        };
-
-        let mesh_normal_tex = Texture::default_normal();
-        let mesh_orm_tex = Texture::default_orm();
+        let mesh = mesh_loader::load_mesh("assets/models/material_ball.gltf");
 
         let mesh_material = Material {
             name: "Object".to_string(),
-            textures: vec![mesh_color_tex, mesh_normal_tex, mesh_orm_tex],
+            textures: vec![
+                Texture::default_color(),
+                Texture::default_normal(),
+                Texture::default_orm()
+            ],
+            pbr_parameters: Some(PbrParameters {
+                color_tint: [0.82, 0.76, 0.09, 1.0],
+                ..Default::default()
+            }),
             ..Material::default_pbr()
         };
 

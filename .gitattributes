@@ -1,3 +1,5 @@
-# LFS attributes for GLTF files
+# LFS attributes for GLTF and texture files
 *.glb filter=lfs diff=lfs merge=lfs -text
 *.bin filter=lfs diff=lfs merge=lfs -text
+*.png filter=lfs diff=lfs merge=lfs -text
+*.exr filter=lfs diff=lfs merge=lfs -text
