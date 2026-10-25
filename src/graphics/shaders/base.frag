@@ -71,7 +71,7 @@ void main()
     vec3 reflectionVector = reflect(-view_dir, normal);
 
     int prefilteredMapMipmapCount = textureQueryLevels(prefilteredMap);
-    vec3 reflection = textureLod(prefilteredMap, reflectionVector, roughness * prefilteredMapMipmapCount).rgb;
+    vec3 reflection = textureLod(prefilteredMap, rotateY(reflectionVector, lighting_settings.angle), roughness * prefilteredMapMipmapCount).rgb;
     vec2 brdf = texture(brdfIntegrationMap, vec2(NdotV, roughness)).rg;
 
     vec3 ibl_specular = exposure * reflection * (specularContribution * brdf.x + brdf.y);
