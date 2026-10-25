@@ -24,7 +24,7 @@ impl PostProcessRenderingSystem
 
 impl System for PostProcessRenderingSystem
 {
-    fn update(&self, delta_time: f32, world: &World)
+    fn update(&self, _: f32, world: &World)
     {
         let mut gfx_api_ref = self.gfx_api.borrow_mut();
 
